@@ -5,6 +5,8 @@
 //! is payable once approving weight exceeds half of the total contributions.
 
 use crate::SplitContract;
+#[allow(unused_imports)]
+use crate::{SplitContractArgs, SplitContractClient};
 use soroban_sdk::{
     contractimpl, contracttype, symbol_short, token, Address, Env, Map, String,
 };
@@ -232,7 +234,6 @@ impl SplitContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SplitContractClient;
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::token::StellarAssetClient;
 

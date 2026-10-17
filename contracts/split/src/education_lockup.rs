@@ -6,6 +6,8 @@
 //! the lockup is not released before its expiry ledger, the funder may reclaim.
 
 use crate::SplitContract;
+#[allow(unused_imports)]
+use crate::{SplitContractArgs, SplitContractClient};
 use soroban_sdk::{contractimpl, contracttype, symbol_short, token, Address, Env, Vec};
 
 #[contracttype]
@@ -167,7 +169,6 @@ impl SplitContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SplitContractClient;
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
 
