@@ -76,6 +76,7 @@ mod migrations;
 mod insurance_pool;
 mod sustainability;
 mod cooperative;
+mod education_lockup;
 
 use error::ContractError;
 use validation::assert_valid_bps;
