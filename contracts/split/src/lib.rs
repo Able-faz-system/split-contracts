@@ -74,6 +74,7 @@ mod storage_keys;
 mod migrations;
 
 mod insurance_pool;
+mod sustainability;
 
 use error::ContractError;
 use validation::assert_valid_bps;
