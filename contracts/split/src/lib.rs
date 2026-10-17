@@ -73,6 +73,8 @@ mod storage_keys;
 
 mod migrations;
 
+mod insurance_pool;
+
 use error::ContractError;
 use validation::assert_valid_bps;
 use calc::{calc_platform_fee, funding_bps};
