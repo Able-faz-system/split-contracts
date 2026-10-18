@@ -1951,6 +1951,38 @@ pub fn invoice_priority_cleared(env: &Env, invoice_id: u64, cleared_by: &Address
     );
 }
 
+// ---------------------------------------------------------------------------
+// Issue #919: Creator fee tier system
+// ---------------------------------------------------------------------------
+
+/// Issue #919: Emitted when the creator fee tier table is replaced, updated or
+/// cleared (`version == 0`, `tier_count == 0` on clear).
+/// Topics: (split, cfee_cfg)
+/// Data: (version, tier_count)
+pub fn creator_fee_tiers_configured(env: &Env, version: u32, tier_count: u32) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("cfee_cfg")),
+        (version, tier_count),
+    );
+}
+
+/// Issue #919: Emitted when a creator's tracked fee tier changes.
+/// Topics: (split, cfee_chg, creator)
+/// Data: (old_tier_id, new_tier_id, fee_bps, volume)
+pub fn creator_fee_tier_changed(
+    env: &Env,
+    creator: &Address,
+    old_tier_id: Option<u32>,
+    new_tier_id: u32,
+    fee_bps: u32,
+    volume: i128,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("cfee_chg"), creator.clone()),
+        (old_tier_id, new_tier_id, fee_bps, volume),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

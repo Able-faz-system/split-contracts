@@ -74,6 +74,7 @@ mod storage_keys;
 mod migrations;
 
 mod priority;
+mod creator_fee_tiers;
 
 use error::ContractError;
 use validation::assert_valid_bps;
