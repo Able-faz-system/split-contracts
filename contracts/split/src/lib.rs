@@ -40,6 +40,11 @@ const COST_ESTIMATE_TOLERANCE_BPS: u64 = 1_000;
 /// Issue #924: Maximum distinct operations tracked by the profiler.
 const MAX_PROFILED_OPERATIONS: u32 = 32;
 
+/// Issue #925: Default maximum invoices per payment batch.
+const DEFAULT_PAYMENT_BATCH_LIMIT: u32 = 25;
+/// Issue #925: Hard upper bound an admin may raise the batch limit to.
+const MAX_PAYMENT_BATCH_LIMIT: u32 = 50;
+
 /// Issue #296: Maximum entries in the per-creator fee waiver list.
 const MAX_FEE_WAIVER_ENTRIES: usize = 100;
 /// Issue #922: Maximum entries retained in the fee waiver audit log (oldest dropped first).
@@ -103,7 +108,8 @@ use soroban_sdk::{
 const MAX_PARENT_DEPTH: u32 = 10;
 
 use types::{
-    AdminAction, AdminRole, AdminSet, AuditEntry, Bid, CircuitBreakerConfig, CircuitBreakerState,
+    AdminAction, AdminRole, AdminSet, AuditEntry, BatchExecutionReport, BatchingStats, Bid,
+    CircuitBreakerConfig, CircuitBreakerState,
     CircuitBreakerStatus, CircuitBreakerTransition, CostEstimate, OperationCostModel,
     OperationCostReport, OperationProfile,
     CloneOverrides, CompactInvoice, CompactMigrateResult, CompletionProof, ComputeEstimate,
@@ -113,7 +119,7 @@ use types::{
     Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceExt3, InvoiceHot, InvoiceOptions,
     InvoiceOptions2, InvoicePayment, InvoiceStats, InvoiceStatus, InvoiceTemplate,
     InvoiceTemplateRecord, LegacyInvoice, OverflowBehavior, OverfundingPolicy, Payment,
-    PaymentCertificate, PaymentCommitment, PaymentProof, PaymentRecord, PendingAdminAction,
+    PaymentBatch, PaymentBatchStatus, PaymentCertificate, PaymentCommitment, PaymentProof, PaymentRecord, PendingAdminAction,
     ProtocolFeeConfig, QueuedAction, RebateTier, Recipient, RepScore, ResolveAction,
     ResolveRule, Role, SimulateReleaseResult, SplitRule, SubscriptionParams, TimelockAction,
     Tombstone, Tranche, TransferRecord, TreasuryRecord, UpgradeProposal,
@@ -253,6 +259,26 @@ fn circuit_breaker_recovery_key() -> Symbol {
 /// Issue #923: Bounded history of state transitions.
 fn circuit_breaker_history_key() -> Symbol {
     symbol_short!("cb_hist")
+}
+
+/// Issue #925: Next payment batch id counter.
+fn payment_batch_next_id_key() -> Symbol {
+    symbol_short!("pb_next")
+}
+
+/// Issue #925: Payment batch record.
+fn payment_batch_key(batch_id: u64) -> (Symbol, u64) {
+    (symbol_short!("pay_bat"), batch_id)
+}
+
+/// Issue #925: Admin-configured maximum invoices per batch.
+fn payment_batch_limit_key() -> Symbol {
+    symbol_short!("pb_limit")
+}
+
+/// Issue #925: Cumulative batching metrics.
+fn payment_batch_stats_key() -> Symbol {
+    symbol_short!("pb_stats")
 }
 
 /// Issue #924: Admin-configured cost model override for an operation.
@@ -2405,6 +2431,46 @@ fn require_fn_not_paused(env: &Env, name: &Symbol) {
     if paused_fns.iter().any(|f| f == *name) {
         panic!("function paused");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #925: Payment batching helpers
+// ---------------------------------------------------------------------------
+
+fn load_payment_batch(env: &Env, batch_id: u64) -> PaymentBatch {
+    env.storage()
+        .persistent()
+        .get(&payment_batch_key(batch_id))
+        .expect("batch not found")
+}
+
+/// Load a batch the payer may still modify.
+fn load_open_payment_batch(env: &Env, batch_id: u64, payer: &Address) -> PaymentBatch {
+    let batch = load_payment_batch(env, batch_id);
+    assert!(batch.payer == *payer, "not batch owner");
+    assert!(batch.status == PaymentBatchStatus::Open, "batch is not open");
+    batch
+}
+
+fn payment_batch_limit(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&payment_batch_limit_key())
+        .unwrap_or(DEFAULT_PAYMENT_BATCH_LIMIT)
+}
+
+fn load_batching_stats(env: &Env) -> BatchingStats {
+    env.storage()
+        .persistent()
+        .get(&payment_batch_stats_key())
+        .unwrap_or(BatchingStats {
+            batches_executed: 0,
+            items_processed: 0,
+            total_volume: 0,
+            transfers_saved: 0,
+            estimated_insns_saved: 0,
+            last_savings_bps: 0,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -8406,17 +8472,29 @@ impl SplitContract {
     pub fn pool_pay(env: Env, payer: Address, payments: Vec<InvoicePayment>) {
         require_not_paused(&env);
         payer.require_auth();
+        Self::_pool_pay(&env, &payer, &payments, symbol_short!("pool_pay"));
+    }
 
+    /// Shared accounting for `pool_pay` and `execute_payment_batch` (issue #925).
+    /// Validates every payment, performs one token transfer and credits each
+    /// invoice; any failure panics so the whole call reverts. Returns the total
+    /// transferred. Callers are responsible for auth and pause checks.
+    fn _pool_pay(
+        env: &Env,
+        payer: &Address,
+        payments: &Vec<InvoicePayment>,
+        action: Symbol,
+    ) -> i128 {
         assert!(!payments.is_empty(), "payments must not be empty");
 
         // Determine the shared token from the first invoice.
-        let first_inv = load_invoice(&env, payments.get(0).unwrap().invoice_id);
+        let first_inv = load_invoice(env, payments.get(0).unwrap().invoice_id);
         let shared_token = funding_token_for(&first_inv);
 
         // Validate all payments and compute total.
         let mut total: i128 = 0;
         for p in payments.iter() {
-            let inv = load_invoice(&env, p.invoice_id);
+            let inv = load_invoice(env, p.invoice_id);
             assert!(
                 inv.status == InvoiceStatus::Pending,
                 "invoice is not pending"
@@ -8441,19 +8519,19 @@ impl SplitContract {
         }
 
         // Single token transfer from payer to contract.
-        let token_client = token::Client::new(&env, &shared_token);
-        token_client.transfer(&payer, &env.current_contract_address(), &total);
+        let token_client = token::Client::new(env, &shared_token);
+        token_client.transfer(payer, &env.current_contract_address(), &total);
 
         // Update each invoice via internal accounting (no further token transfers).
         for p in payments.iter() {
-            let mut inv = load_invoice(&env, p.invoice_id);
+            let mut inv = load_invoice(env, p.invoice_id);
             // Write payment to sharded storage (issue #177).
-            let shard_id = compute_shard_id(&env, &payer);
+            let shard_id = compute_shard_id(env, payer);
             let mut shard_payments: Vec<Payment> = env
                 .storage()
                 .persistent()
                 .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(p.invoice_id, shard_id))
-                .unwrap_or_else(|| Vec::new(&env));
+                .unwrap_or_else(|| Vec::new(env));
             shard_payments.push_back(Payment {
                 payer: payer.clone(),
                 amount: p.amount,
@@ -8474,8 +8552,8 @@ impl SplitContract {
                 .persistent()
                 .set(&cumulative_key, &(cumulative + p.amount));
 
-            append_audit_entry(&env, p.invoice_id, symbol_short!("pool_pay"), &payer);
-            events::payment_received(&env, p.invoice_id, &payer, p.amount, &shared_token);
+            append_audit_entry(env, p.invoice_id, action.clone(), payer);
+            events::payment_received(env, p.invoice_id, payer, p.amount, &shared_token);
 
             let inv_total: i128 = inv.amounts.iter().sum();
             if inv.funded >= inv_total {
@@ -8495,14 +8573,247 @@ impl SplitContract {
                             < (inv.amounts.iter().sum::<i128>() * inv.min_funding_bps as i128
                                 / 10_000));
                 if guarded {
-                    save_invoice(&env, p.invoice_id, &inv);
+                    save_invoice(env, p.invoice_id, &inv);
                 } else {
-                    Self::_release(&env, p.invoice_id, &mut inv, &payer);
+                    Self::_release(env, p.invoice_id, &mut inv, payer);
                 }
             } else {
-                save_invoice(&env, p.invoice_id, &inv);
+                save_invoice(env, p.invoice_id, &inv);
             }
         }
+        total
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #925: Payment batching
+    // -----------------------------------------------------------------------
+
+    /// Open an empty payment batch for `payer` settling in `token`. Returns the batch id.
+    pub fn open_payment_batch(env: Env, payer: Address, token: Address) -> u64 {
+        require_not_paused(&env);
+        payer.require_auth();
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&payment_batch_next_id_key())
+            .unwrap_or(1);
+        env.storage()
+            .persistent()
+            .set(&payment_batch_next_id_key(), &(id + 1));
+        let batch = PaymentBatch {
+            id,
+            payer: payer.clone(),
+            token: token.clone(),
+            items: Vec::new(&env),
+            total: 0,
+            status: PaymentBatchStatus::Open,
+            created_at: env.ledger().timestamp(),
+            executed_at: 0,
+        };
+        env.storage().persistent().set(&payment_batch_key(id), &batch);
+        events::payment_batch_opened(&env, id, &payer, &token);
+        id
+    }
+
+    /// Add a payment toward `invoice_id` to an open batch.
+    ///
+    /// The invoice must be pending, not disputed, before its deadline and
+    /// funded in the batch token; the combined batched amount must not exceed
+    /// its remaining balance. Adding to an invoice already in the batch merges
+    /// the amounts. Panics with `BatchLimitExceeded` past the batch size limit.
+    pub fn add_to_payment_batch(
+        env: Env,
+        payer: Address,
+        batch_id: u64,
+        invoice_id: u64,
+        amount: i128,
+    ) {
+        require_not_paused(&env);
+        payer.require_auth();
+        let mut batch = load_open_payment_batch(&env, batch_id, &payer);
+        assert!(amount > 0, "payment amount must be positive");
+
+        let inv = load_invoice(&env, invoice_id);
+        assert!(inv.status == InvoiceStatus::Pending, "invoice is not pending");
+        assert!(!inv.disputed, "invoice is disputed");
+        assert!(
+            env.ledger().timestamp() <= inv.deadline,
+            "invoice deadline has passed"
+        );
+        assert!(
+            funding_token_for(&inv) == batch.token,
+            "all invoices must use the same token"
+        );
+
+        let mut existing: Option<u32> = None;
+        for (i, item) in batch.items.iter().enumerate() {
+            if item.invoice_id == invoice_id {
+                existing = Some(i as u32);
+            }
+        }
+        let batched_so_far = existing
+            .map(|i| batch.items.get(i).unwrap().amount)
+            .unwrap_or(0);
+        let new_amount = batched_so_far
+            .checked_add(amount)
+            .expect("payment amount overflow");
+        let inv_total: i128 = inv.amounts.iter().sum();
+        assert!(
+            inv.funded + new_amount <= inv_total,
+            "payment exceeds remaining balance"
+        );
+
+        match existing {
+            Some(i) => batch.items.set(
+                i,
+                InvoicePayment {
+                    invoice_id,
+                    amount: new_amount,
+                },
+            ),
+            None => {
+                if batch.items.len() >= payment_batch_limit(&env) {
+                    panic!("BatchLimitExceeded");
+                }
+                batch.items.push_back(InvoicePayment { invoice_id, amount });
+            }
+        }
+        batch.total = batch.total.checked_add(amount).expect("batch total overflow");
+        env.storage()
+            .persistent()
+            .set(&payment_batch_key(batch_id), &batch);
+    }
+
+    /// Remove an invoice's payment from an open batch.
+    pub fn remove_from_payment_batch(env: Env, payer: Address, batch_id: u64, invoice_id: u64) {
+        payer.require_auth();
+        let mut batch = load_open_payment_batch(&env, batch_id, &payer);
+        let mut kept: Vec<InvoicePayment> = Vec::new(&env);
+        let mut total: i128 = 0;
+        for item in batch.items.iter() {
+            if item.invoice_id != invoice_id {
+                total += item.amount;
+                kept.push_back(item);
+            }
+        }
+        assert!(kept.len() < batch.items.len(), "invoice not in batch");
+        batch.items = kept;
+        batch.total = total;
+        env.storage()
+            .persistent()
+            .set(&payment_batch_key(batch_id), &batch);
+    }
+
+    /// Cancel an open batch. No funds have moved, so nothing is refunded.
+    pub fn cancel_payment_batch(env: Env, payer: Address, batch_id: u64) {
+        payer.require_auth();
+        let mut batch = load_open_payment_batch(&env, batch_id, &payer);
+        batch.status = PaymentBatchStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&payment_batch_key(batch_id), &batch);
+        events::payment_batch_cancelled(&env, batch_id, &payer);
+    }
+
+    /// Settle every payment in the batch atomically with a single token transfer.
+    ///
+    /// All items are re-validated before any funds move; if any item is no
+    /// longer valid (e.g. the invoice was funded or expired meanwhile) the
+    /// whole call reverts and the batch stays open. Returns a cost comparison
+    /// against paying each invoice individually.
+    pub fn execute_payment_batch(env: Env, payer: Address, batch_id: u64) -> BatchExecutionReport {
+        require_fn_not_paused(&env, &symbol_short!("pay"));
+        require_not_frozen(&env);
+        payer.require_auth();
+        let mut batch = load_open_payment_batch(&env, batch_id, &payer);
+        assert!(!batch.items.is_empty(), "payments must not be empty");
+
+        // Estimate cost before execution, while recipient counts are still readable.
+        let item_count = batch.items.len();
+        let pay_op = symbol_short!("pay");
+        let mut unbatched_cpu_insns: u64 = 0;
+        let mut recipients_total: u32 = 0;
+        for item in batch.items.iter() {
+            let recipients = load_invoice(&env, item.invoice_id).recipients.len();
+            recipients_total = recipients_total.saturating_add(recipients);
+            unbatched_cpu_insns = unbatched_cpu_insns.saturating_add(
+                compute_cost_estimate(&env, &pay_op, recipients, 0, 0).cpu_insns,
+            );
+        }
+        let batched_cpu_insns = compute_cost_estimate(
+            &env,
+            &symbol_short!("batch_pay"),
+            recipients_total,
+            0,
+            item_count,
+        )
+        .cpu_insns;
+
+        batch.status = PaymentBatchStatus::Executed;
+        batch.executed_at = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&payment_batch_key(batch_id), &batch);
+
+        let total = Self::_pool_pay(&env, &payer, &batch.items, symbol_short!("batch_pay"));
+
+        let saved_insns = unbatched_cpu_insns.saturating_sub(batched_cpu_insns);
+        let savings_bps = if unbatched_cpu_insns == 0 {
+            0
+        } else {
+            ((saved_insns as u128) * 10_000 / (unbatched_cpu_insns as u128)) as u32
+        };
+        let report = BatchExecutionReport {
+            batch_id,
+            item_count,
+            total_amount: total,
+            token_transfers: 1,
+            transfers_saved: item_count - 1,
+            batched_cpu_insns,
+            unbatched_cpu_insns,
+            savings_bps,
+        };
+
+        let mut stats = load_batching_stats(&env);
+        stats.batches_executed += 1;
+        stats.items_processed += item_count as u64;
+        stats.total_volume = stats.total_volume.saturating_add(total);
+        stats.transfers_saved += (item_count - 1) as u64;
+        stats.estimated_insns_saved = stats.estimated_insns_saved.saturating_add(saved_insns);
+        stats.last_savings_bps = savings_bps;
+        env.storage()
+            .persistent()
+            .set(&payment_batch_stats_key(), &stats);
+
+        events::payment_batch_executed(&env, batch_id, &payer, item_count, total, savings_bps);
+        report
+    }
+
+    /// Set the maximum invoices per batch (1..=50). SuperAdmin only.
+    pub fn set_payment_batch_limit(env: Env, admin: Address, limit: u32) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        assert!(
+            limit > 0 && limit <= MAX_PAYMENT_BATCH_LIMIT,
+            "batch limit out of range"
+        );
+        env.storage()
+            .persistent()
+            .set(&payment_batch_limit_key(), &limit);
+    }
+
+    /// Returns the maximum invoices per batch.
+    pub fn get_payment_batch_limit(env: Env) -> u32 {
+        payment_batch_limit(&env)
+    }
+
+    /// Returns a payment batch by id. Panics with "batch not found" if absent.
+    pub fn get_payment_batch(env: Env, batch_id: u64) -> PaymentBatch {
+        load_payment_batch(&env, batch_id)
+    }
+
+    /// Returns cumulative batching metrics.
+    pub fn get_batching_stats(env: Env) -> BatchingStats {
+        load_batching_stats(&env)
     }
 
     // -----------------------------------------------------------------------

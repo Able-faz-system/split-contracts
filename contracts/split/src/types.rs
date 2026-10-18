@@ -1653,6 +1653,58 @@ pub struct ComputeEstimate {
     pub fee_stroops: i128,
 }
 
+/// Issue #925: Lifecycle of a payment batch.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PaymentBatchStatus {
+    Open,
+    Executed,
+    Cancelled,
+}
+
+/// Issue #925: Payments collected for one payer, settled with a single token transfer.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaymentBatch {
+    pub id: u64,
+    pub payer: Address,
+    pub token: Address,
+    /// One entry per invoice; repeated additions to the same invoice are merged.
+    pub items: Vec<InvoicePayment>,
+    pub total: i128,
+    pub status: PaymentBatchStatus,
+    pub created_at: u64,
+    pub executed_at: u64,
+}
+
+/// Issue #925: Outcome and cost comparison of one executed batch.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchExecutionReport {
+    pub batch_id: u64,
+    pub item_count: u32,
+    pub total_amount: i128,
+    /// Token transfers performed (always 1) vs. one per item when paid individually.
+    pub token_transfers: u32,
+    pub transfers_saved: u32,
+    pub batched_cpu_insns: u64,
+    pub unbatched_cpu_insns: u64,
+    /// Estimated instruction savings vs. individual `pay` calls, in basis points.
+    pub savings_bps: u32,
+}
+
+/// Issue #925: Cumulative batching metrics.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchingStats {
+    pub batches_executed: u64,
+    pub items_processed: u64,
+    pub total_volume: i128,
+    pub transfers_saved: u64,
+    pub estimated_insns_saved: u64,
+    pub last_savings_bps: u32,
+}
+
 /// Issue #924: Linear cost model for one operation.
 ///
 /// `cpu = base_insns + recipients * per_recipient_insns + payers * per_payer_insns

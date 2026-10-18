@@ -9134,3 +9134,202 @@ fn test_924_unknown_operation_rejected() {
     let c = client(&env, &contract_id);
     c.estimate_operation_cost(&symbol_short!("nope"), &1_u32, &0_u32, &0_u32);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #925: Payment batching
+// ---------------------------------------------------------------------------
+
+fn setup_payment_batch() -> (Env, Address, Address, Address, Address) {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &10_000);
+    (env, contract_id, token_id, admin, payer)
+}
+
+#[test]
+fn test_925_batch_collects_and_executes_atomically() {
+    let (env, contract_id, token_id, _admin, payer) = setup_payment_batch();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+    let creator = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let r3 = Address::generate(&env);
+
+    let id1 = make_invoice(&env, &c, &creator, &r1, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &r2, 200, &token_id, 9_999);
+    let id3 = make_invoice(&env, &c, &creator, &r3, 300, &token_id, 9_999);
+
+    let batch_id = c.open_payment_batch(&payer, &token_id);
+    c.add_to_payment_batch(&payer, &batch_id, &id1, &100_i128);
+    c.add_to_payment_batch(&payer, &batch_id, &id2, &50_i128);
+    c.add_to_payment_batch(&payer, &batch_id, &id3, &300_i128);
+
+    let batch = c.get_payment_batch(&batch_id);
+    assert_eq!(batch.items.len(), 3);
+    assert_eq!(batch.total, 450);
+    assert_eq!(batch.status, types::PaymentBatchStatus::Open);
+
+    let report = c.execute_payment_batch(&payer, &batch_id);
+    assert_eq!(report.item_count, 3);
+    assert_eq!(report.total_amount, 450);
+    assert_eq!(report.token_transfers, 1);
+    assert_eq!(report.transfers_saved, 2);
+
+    assert_eq!(tk.balance(&payer), 10_000 - 450);
+    assert_eq!(tk.balance(&r1), 100, "fully funded invoice auto-releases");
+    assert_eq!(c.get_invoice(&id2).funded, 50);
+    assert_eq!(c.get_payment_batch(&batch_id).status, types::PaymentBatchStatus::Executed);
+}
+
+#[test]
+fn test_925_batching_saves_at_least_twenty_percent() {
+    let (env, contract_id, token_id, _admin, payer) = setup_payment_batch();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+
+    let batch_id = c.open_payment_batch(&payer, &token_id);
+    for _ in 0..5 {
+        let id = make_invoice(&env, &c, &creator, &Address::generate(&env), 1_000, &token_id, 9_999);
+        c.add_to_payment_batch(&payer, &batch_id, &id, &10_i128);
+    }
+    let report = c.execute_payment_batch(&payer, &batch_id);
+    assert!(report.batched_cpu_insns < report.unbatched_cpu_insns);
+    assert!(report.savings_bps >= 2_000, "expected >= 20% savings, got {} bps", report.savings_bps);
+
+    let stats = c.get_batching_stats();
+    assert_eq!(stats.batches_executed, 1);
+    assert_eq!(stats.items_processed, 5);
+    assert_eq!(stats.total_volume, 50);
+    assert_eq!(stats.transfers_saved, 4);
+    assert_eq!(stats.last_savings_bps, report.savings_bps);
+}
+
+#[test]
+fn test_925_adding_same_invoice_merges_amounts() {
+    let (env, contract_id, token_id, _admin, payer) = setup_payment_batch();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let id = make_invoice(&env, &c, &creator, &Address::generate(&env), 500, &token_id, 9_999);
+
+    let batch_id = c.open_payment_batch(&payer, &token_id);
+    c.add_to_payment_batch(&payer, &batch_id, &id, &100_i128);
+    c.add_to_payment_batch(&payer, &batch_id, &id, &150_i128);
+
+    let batch = c.get_payment_batch(&batch_id);
+    assert_eq!(batch.items.len(), 1);
+    assert_eq!(batch.items.get(0).unwrap().amount, 250);
+    assert_eq!(batch.total, 250);
+}
+
+#[test]
+#[should_panic(expected = "payment exceeds remaining balance")]
+fn test_925_merged_amount_cannot_overfund() {
+    let (env, contract_id, token_id, _admin, payer) = setup_payment_batch();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let id = make_invoice(&env, &c, &creator, &Address::generate(&env), 200, &token_id, 9_999);
+
+    let batch_id = c.open_payment_batch(&payer, &token_id);
+    c.add_to_payment_batch(&payer, &batch_id, &id, &150_i128);
+    c.add_to_payment_batch(&payer, &batch_id, &id, &100_i128);
+}
+
+#[test]
+#[should_panic(expected = "BatchLimitExceeded")]
+fn test_925_batch_size_limit_enforced() {
+    let (env, contract_id, token_id, admin, payer) = setup_payment_batch();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    c.set_payment_batch_limit(&admin, &2_u32);
+    assert_eq!(c.get_payment_batch_limit(), 2);
+
+    let batch_id = c.open_payment_batch(&payer, &token_id);
+    for _ in 0..3 {
+        let id = make_invoice(&env, &c, &creator, &Address::generate(&env), 100, &token_id, 9_999);
+        c.add_to_payment_batch(&payer, &batch_id, &id, &10_i128);
+    }
+}
+
+#[test]
+#[should_panic(expected = "batch limit out of range")]
+fn test_925_batch_limit_above_cap_rejected() {
+    let (env, contract_id, _token_id, admin, _payer) = setup_payment_batch();
+    let c = client(&env, &contract_id);
+    c.set_payment_batch_limit(&admin, &51_u32);
+}
+
+#[test]
+fn test_925_invalid_item_reverts_whole_batch() {
+    let (env, contract_id, token_id, _admin, payer) = setup_payment_batch();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+    let creator = Address::generate(&env);
+    let other_payer = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&other_payer, &1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &Address::generate(&env), 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &Address::generate(&env), 100, &token_id, 9_999);
+
+    let batch_id = c.open_payment_batch(&payer, &token_id);
+    c.add_to_payment_batch(&payer, &batch_id, &id1, &50_i128);
+    c.add_to_payment_batch(&payer, &batch_id, &id2, &80_i128);
+
+    // id2 is partly funded elsewhere, so the batched 80 no longer fits.
+    c.pay(&other_payer, &id2, &50_i128, &0_u64, &false, &false, &None);
+
+    let result = c.try_execute_payment_batch(&payer, &batch_id);
+    assert!(result.is_err(), "execution must fail when any item is invalid");
+    assert_eq!(tk.balance(&payer), 10_000, "no funds move on failure");
+    assert_eq!(c.get_invoice(&id1).funded, 0, "valid items are rolled back too");
+    assert_eq!(c.get_payment_batch(&batch_id).status, types::PaymentBatchStatus::Open);
+}
+
+#[test]
+#[should_panic(expected = "batch is not open")]
+fn test_925_cancelled_batch_cannot_execute() {
+    let (env, contract_id, token_id, _admin, payer) = setup_payment_batch();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let id = make_invoice(&env, &c, &creator, &Address::generate(&env), 100, &token_id, 9_999);
+
+    let batch_id = c.open_payment_batch(&payer, &token_id);
+    c.add_to_payment_batch(&payer, &batch_id, &id, &50_i128);
+    c.cancel_payment_batch(&payer, &batch_id);
+    c.execute_payment_batch(&payer, &batch_id);
+}
+
+#[test]
+#[should_panic(expected = "not batch owner")]
+fn test_925_only_owner_can_modify_batch() {
+    let (env, contract_id, token_id, _admin, payer) = setup_payment_batch();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let id = make_invoice(&env, &c, &creator, &Address::generate(&env), 100, &token_id, 9_999);
+
+    let batch_id = c.open_payment_batch(&payer, &token_id);
+    c.add_to_payment_batch(&Address::generate(&env), &batch_id, &id, &50_i128);
+}
+
+#[test]
+fn test_925_remove_from_batch_updates_total() {
+    let (env, contract_id, token_id, _admin, payer) = setup_payment_batch();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let id1 = make_invoice(&env, &c, &creator, &Address::generate(&env), 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &Address::generate(&env), 100, &token_id, 9_999);
+
+    let batch_id = c.open_payment_batch(&payer, &token_id);
+    c.add_to_payment_batch(&payer, &batch_id, &id1, &40_i128);
+    c.add_to_payment_batch(&payer, &batch_id, &id2, &60_i128);
+    c.remove_from_payment_batch(&payer, &batch_id, &id1);
+
+    let batch = c.get_payment_batch(&batch_id);
+    assert_eq!(batch.items.len(), 1);
+    assert_eq!(batch.total, 60);
+}

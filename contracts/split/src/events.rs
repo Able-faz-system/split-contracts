@@ -600,6 +600,43 @@ pub fn circuit_breaker_deactivated(env: &Env) {
         .publish((symbol_short!("split"), symbol_short!("cb_dact")), ());
 }
 
+/// Issue #925: Emitted when a payment batch is opened.
+/// Topics: (split, pb_open, payer)
+/// Data: (batch_id, token)
+pub fn payment_batch_opened(env: &Env, batch_id: u64, payer: &Address, token: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pb_open"), payer.clone()),
+        (batch_id, token.clone()),
+    );
+}
+
+/// Issue #925: Emitted when a payment batch is executed.
+/// Topics: (split, pb_exec, payer)
+/// Data: (batch_id, item_count, total_amount, savings_bps)
+pub fn payment_batch_executed(
+    env: &Env,
+    batch_id: u64,
+    payer: &Address,
+    item_count: u32,
+    total_amount: i128,
+    savings_bps: u32,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pb_exec"), payer.clone()),
+        (batch_id, item_count, total_amount, savings_bps),
+    );
+}
+
+/// Issue #925: Emitted when a payment batch is cancelled.
+/// Topics: (split, pb_cncl, payer)
+/// Data: batch_id
+pub fn payment_batch_cancelled(env: &Env, batch_id: u64, payer: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pb_cncl"), payer.clone()),
+        batch_id,
+    );
+}
+
 /// Issue #923: Emitted on every circuit breaker state transition.
 /// Topics: (split, cb_state)
 /// Data: (from, to, actor, reason, ledger)
