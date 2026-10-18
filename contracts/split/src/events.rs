@@ -415,6 +415,16 @@ pub fn archival_policy_updated(env: &Env, admin: &Address, enabled: bool, retent
     );
 }
 
+/// Issue #928: Emitted on every recipient authentication state change.
+/// Topics: (split, rcp_auth, invoice_id)
+/// Data: (recipient, action, ledger)
+pub fn recipient_auth_changed(env: &Env, invoice_id: u64, recipient: &Address, action: soroban_sdk::Symbol) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("rcp_auth"), invoice_id),
+        (recipient.clone(), action, env.ledger().sequence()),
+    );
+}
+
 /// Emitted when an invoice is paused.
 /// Topics: (split, paused, invoice_id)
 /// Data: (creator, reason, auto_resume_at)

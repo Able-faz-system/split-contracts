@@ -94,7 +94,7 @@ use types::{
     DisputeOutcome, DisputeRecord, DisputeStatus, FeeBracket, FeeSplit, FeeTier, InstalmentPlan,
     Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceExt3, InvoiceHot, InvoiceOptions,
     InvoiceOptions2, InvoicePayment, InvoiceStats, InvoiceStatus, InvoiceTemplate,
-    InvoiceTemplateRecord, LegacyInvoice, OverflowBehavior, OverfundingPolicy, Payment,
+    InvoiceTemplateRecord, LegacyInvoice, RecipientAuth, RecipientAuthLogEntry, RecipientAuthStatus, OverflowBehavior, OverfundingPolicy, Payment,
     PaymentCertificate, PaymentCommitment, PaymentProof, PaymentRecord, PendingAdminAction,
     ProtocolFeeConfig, QueuedAction, RebateTier, Recipient, RepScore, ResolveAction,
     ResolveRule, Role, SimulateReleaseResult, SplitRule, SubscriptionParams, TimelockAction,
@@ -8614,6 +8614,11 @@ impl SplitContract {
         if invoice.status == InvoiceStatus::Disputed {
             panic!("{}", ContractError::InvoiceDisputed as u32);
         }
+        // Issue #928: no funds move to unverified recipients.
+        assert!(
+            recipients_verified(env, invoice_id, invoice),
+            "recipient not verified"
+        );
         if invoice.tranches.is_empty() {
             Self::_release_full(env, invoice_id, invoice, actor);
         } else {
@@ -8628,6 +8633,11 @@ impl SplitContract {
         actor: &Address,
     ) {
         if invoice.milestones.is_empty() {
+            return;
+        }
+        // Issue #928: hold milestone payouts in escrow until every recipient
+        // has completed authentication.
+        if !recipients_verified(env, invoice_id, invoice) {
             return;
         }
         let total: i128 = invoice.amounts.iter().sum();
@@ -15306,6 +15316,88 @@ fn purge_archived_invoice(env: &Env, id: u64, actor: &Address) {
     events::invoice_archive_purged(env, id);
 }
 
+/// Issue #928: failed responses allowed before a challenge is locked out.
+const MAX_RECIPIENT_AUTH_ATTEMPTS: u32 = 3;
+/// Issue #928: bounds on a challenge's lifetime, in seconds.
+const MIN_RECIPIENT_AUTH_TTL_SECS: u64 = 60;
+const MAX_RECIPIENT_AUTH_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+fn recipient_auth_key(invoice_id: u64, recipient: &Address) -> (Symbol, u64, Address) {
+    (symbol_short!("rcp_auth"), invoice_id, recipient.clone())
+}
+
+fn recipient_auth_required_key(invoice_id: u64) -> (Symbol, u64) {
+    (symbol_short!("rcp_areq"), invoice_id)
+}
+
+fn recipient_auth_log_key(invoice_id: u64) -> (Symbol, u64) {
+    (symbol_short!("rcp_alog"), invoice_id)
+}
+
+fn recipient_auth_nonce_key() -> Symbol {
+    symbol_short!("rcp_anon")
+}
+
+fn is_recipient_auth_required(env: &Env, invoice_id: u64) -> bool {
+    env.storage()
+        .persistent()
+        .get(&recipient_auth_required_key(invoice_id))
+        .unwrap_or(false)
+}
+
+fn load_recipient_auth(env: &Env, invoice_id: u64, recipient: &Address) -> Option<RecipientAuth> {
+    env.storage()
+        .persistent()
+        .get(&recipient_auth_key(invoice_id, recipient))
+}
+
+fn save_recipient_auth(env: &Env, auth: &RecipientAuth) {
+    env.storage()
+        .persistent()
+        .set(&recipient_auth_key(auth.invoice_id, &auth.recipient), auth);
+}
+
+/// Issue #928: true when the invoice does not require authentication, or
+/// every recipient is currently `Verified`.
+fn recipients_verified(env: &Env, invoice_id: u64, invoice: &Invoice) -> bool {
+    if !is_recipient_auth_required(env, invoice_id) {
+        return true;
+    }
+    invoice.recipients.iter().all(|r| {
+        matches!(
+            load_recipient_auth(env, invoice_id, &r),
+            Some(RecipientAuth { status: RecipientAuthStatus::Verified, .. })
+        )
+    })
+}
+
+/// Issue #928: append to the per-invoice verification audit log.
+fn log_recipient_auth(env: &Env, invoice_id: u64, recipient: &Address, action: Symbol, actor: &Address) {
+    let mut log: Vec<RecipientAuthLogEntry> = env
+        .storage()
+        .persistent()
+        .get(&recipient_auth_log_key(invoice_id))
+        .unwrap_or_else(|| Vec::new(env));
+    log.push_back(RecipientAuthLogEntry {
+        recipient: recipient.clone(),
+        action: action.clone(),
+        actor: actor.clone(),
+        timestamp: env.ledger().timestamp(),
+        ledger: env.ledger().sequence(),
+    });
+    env.storage()
+        .persistent()
+        .set(&recipient_auth_log_key(invoice_id), &log);
+    events::recipient_auth_changed(env, invoice_id, recipient, action);
+}
+
+/// Issue #928: expected response to `challenge` — `sha256(challenge || recipient_xdr)`.
+fn recipient_challenge_response(env: &Env, challenge: &BytesN<32>, recipient: &Address) -> BytesN<32> {
+    let mut preimage = Bytes::from_array(env, &challenge.to_array());
+    preimage.append(&recipient.clone().to_xdr(env));
+    env.crypto().sha256(&preimage).into()
+}
+
 fn clone_record_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("clone_rec"), id)
 }
@@ -16441,5 +16533,213 @@ impl SplitContract {
             }
         }
         purged
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #928: Recipient authentication (challenge-response before payout)
+// ---------------------------------------------------------------------------
+
+#[contractimpl]
+impl SplitContract {
+    /// Require (or stop requiring) every recipient of `invoice_id` to pass
+    /// challenge-response verification before any funds are released to them.
+    /// Creator or co-creator only; the invoice must still be Pending.
+    pub fn set_recipient_auth_required(env: Env, caller: Address, invoice_id: u64, required: bool) {
+        require_not_paused(&env);
+        caller.require_auth();
+        let invoice = load_invoice(&env, invoice_id);
+        require_creator_or_cocreator(&invoice, &caller);
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice not pending");
+        env.storage()
+            .persistent()
+            .set(&recipient_auth_required_key(invoice_id), &required);
+        let action = if required {
+            symbol_short!("auth_on")
+        } else {
+            symbol_short!("auth_off")
+        };
+        append_audit_entry(&env, invoice_id, action, &caller);
+    }
+
+    /// Whether `invoice_id` requires recipient authentication before release.
+    pub fn get_recipient_auth_required(env: Env, invoice_id: u64) -> bool {
+        is_recipient_auth_required(&env, invoice_id)
+    }
+
+    /// Issue a fresh challenge to `recipient`, valid for `ttl_secs`.
+    ///
+    /// The recipient proves control of its address by calling
+    /// [`respond_recipient_challenge`] with its own authorization and
+    /// `sha256(challenge || recipient_xdr)`. Re-issuing replaces any pending
+    /// challenge and resets the attempt counter.
+    pub fn issue_recipient_challenge(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        recipient: Address,
+        ttl_secs: u64,
+    ) -> BytesN<32> {
+        require_not_paused(&env);
+        caller.require_auth();
+        let invoice = load_invoice(&env, invoice_id);
+        require_creator_or_cocreator(&invoice, &caller);
+        assert!(invoice.recipients.contains(&recipient), "not an invoice recipient");
+        assert!(
+            ttl_secs >= MIN_RECIPIENT_AUTH_TTL_SECS && ttl_secs <= MAX_RECIPIENT_AUTH_TTL_SECS,
+            "invalid challenge ttl"
+        );
+        if let Some(existing) = load_recipient_auth(&env, invoice_id, &recipient) {
+            assert!(
+                existing.status != RecipientAuthStatus::Verified,
+                "recipient already verified"
+            );
+        }
+
+        let nonce: u64 = env
+            .storage()
+            .instance()
+            .get(&recipient_auth_nonce_key())
+            .unwrap_or(0u64)
+            + 1;
+        env.storage().instance().set(&recipient_auth_nonce_key(), &nonce);
+
+        let now = env.ledger().timestamp();
+        let mut seed = env.current_contract_address().to_xdr(&env);
+        seed.append(&Bytes::from_array(&env, &invoice_id.to_be_bytes()));
+        seed.append(&recipient.clone().to_xdr(&env));
+        seed.append(&Bytes::from_array(&env, &nonce.to_be_bytes()));
+        seed.append(&Bytes::from_array(&env, &now.to_be_bytes()));
+        seed.append(&Bytes::from_array(&env, &env.ledger().sequence().to_be_bytes()));
+        let challenge: BytesN<32> = env.crypto().sha256(&seed).into();
+
+        save_recipient_auth(
+            &env,
+            &RecipientAuth {
+                invoice_id,
+                recipient: recipient.clone(),
+                status: RecipientAuthStatus::ChallengeIssued,
+                challenge: Some(challenge.clone()),
+                issued_at: now,
+                expires_at: now + ttl_secs,
+                verified_at: None,
+                attempts: 0,
+                nonce,
+            },
+        );
+        log_recipient_auth(&env, invoice_id, &recipient, symbol_short!("chal_iss"), &caller);
+        challenge
+    }
+
+    /// Answer an outstanding challenge. Requires `recipient`'s authorization.
+    ///
+    /// Returns `true` on success. A late response marks the challenge
+    /// `Expired`; a wrong response counts an attempt and, after
+    /// `MAX_RECIPIENT_AUTH_ATTEMPTS`, marks it `Failed`. Both return `false`
+    /// and persist the new state, so a new challenge must then be issued.
+    pub fn respond_recipient_challenge(
+        env: Env,
+        recipient: Address,
+        invoice_id: u64,
+        response: BytesN<32>,
+    ) -> bool {
+        require_not_paused(&env);
+        recipient.require_auth();
+        let mut auth =
+            load_recipient_auth(&env, invoice_id, &recipient).expect("no challenge issued");
+        assert!(
+            auth.status == RecipientAuthStatus::ChallengeIssued,
+            "no active challenge"
+        );
+        let challenge = auth.challenge.clone().expect("no active challenge");
+
+        if env.ledger().timestamp() > auth.expires_at {
+            auth.status = RecipientAuthStatus::Expired;
+            auth.challenge = None;
+            save_recipient_auth(&env, &auth);
+            log_recipient_auth(&env, invoice_id, &recipient, symbol_short!("chal_exp"), &recipient);
+            return false;
+        }
+
+        if response == recipient_challenge_response(&env, &challenge, &recipient) {
+            auth.status = RecipientAuthStatus::Verified;
+            auth.challenge = None;
+            auth.verified_at = Some(env.ledger().timestamp());
+            save_recipient_auth(&env, &auth);
+            log_recipient_auth(&env, invoice_id, &recipient, symbol_short!("verified"), &recipient);
+            append_audit_entry(&env, invoice_id, symbol_short!("rcp_verif"), &recipient);
+            return true;
+        }
+
+        auth.attempts += 1;
+        let action = if auth.attempts >= MAX_RECIPIENT_AUTH_ATTEMPTS {
+            auth.status = RecipientAuthStatus::Failed;
+            auth.challenge = None;
+            symbol_short!("auth_fail")
+        } else {
+            symbol_short!("bad_resp")
+        };
+        save_recipient_auth(&env, &auth);
+        log_recipient_auth(&env, invoice_id, &recipient, action, &recipient);
+        false
+    }
+
+    /// Revoke a recipient's verification (e.g. on a suspected compromise).
+    /// Creator or co-creator only.
+    pub fn revoke_recipient_verification(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        recipient: Address,
+    ) {
+        require_not_paused(&env);
+        caller.require_auth();
+        let invoice = load_invoice(&env, invoice_id);
+        require_creator_or_cocreator(&invoice, &caller);
+        let mut auth =
+            load_recipient_auth(&env, invoice_id, &recipient).expect("no verification record");
+        auth.status = RecipientAuthStatus::Revoked;
+        auth.challenge = None;
+        auth.verified_at = None;
+        save_recipient_auth(&env, &auth);
+        log_recipient_auth(&env, invoice_id, &recipient, symbol_short!("revoked"), &caller);
+    }
+
+    /// Current authentication state for `recipient` on `invoice_id`.
+    /// A pending challenge past its deadline is reported as `Expired`.
+    pub fn get_recipient_auth(env: Env, invoice_id: u64, recipient: Address) -> Option<RecipientAuth> {
+        load_recipient_auth(&env, invoice_id, &recipient).map(|mut auth| {
+            if auth.status == RecipientAuthStatus::ChallengeIssued
+                && env.ledger().timestamp() > auth.expires_at
+            {
+                auth.status = RecipientAuthStatus::Expired;
+            }
+            auth
+        })
+    }
+
+    /// Whether `recipient` is currently verified for `invoice_id`.
+    pub fn is_recipient_verified(env: Env, invoice_id: u64, recipient: Address) -> bool {
+        matches!(
+            load_recipient_auth(&env, invoice_id, &recipient),
+            Some(RecipientAuth { status: RecipientAuthStatus::Verified, .. })
+        )
+    }
+
+    /// Full verification audit log for `invoice_id`, oldest first.
+    pub fn get_recipient_auth_log(env: Env, invoice_id: u64) -> Vec<RecipientAuthLogEntry> {
+        env.storage()
+            .persistent()
+            .get(&recipient_auth_log_key(invoice_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Helper for clients: the response `recipient` must submit for `challenge`.
+    pub fn compute_recipient_challenge_response(
+        env: Env,
+        challenge: BytesN<32>,
+        recipient: Address,
+    ) -> BytesN<32> {
+        recipient_challenge_response(&env, &challenge, &recipient)
     }
 }

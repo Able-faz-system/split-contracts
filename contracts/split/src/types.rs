@@ -1960,6 +1960,50 @@ pub struct ArchivalStats {
     pub sweep_cursor: u64,
 }
 
+/// Issue #928: State machine for recipient address verification.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RecipientAuthStatus {
+    Unverified,
+    /// A challenge is outstanding and awaiting the recipient's response.
+    ChallengeIssued,
+    Verified,
+    /// Too many incorrect responses; a new challenge is required.
+    Failed,
+    /// The challenge was not answered before `expires_at`.
+    Expired,
+    /// Verification was withdrawn by the creator.
+    Revoked,
+}
+
+/// Issue #928: Authentication record for one recipient of one invoice.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RecipientAuth {
+    pub invoice_id: u64,
+    pub recipient: Address,
+    pub status: RecipientAuthStatus,
+    /// Outstanding challenge; cleared once answered, expired or failed.
+    pub challenge: Option<BytesN<32>>,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub verified_at: Option<u64>,
+    /// Incorrect responses to the current challenge.
+    pub attempts: u32,
+    pub nonce: u64,
+}
+
+/// Issue #928: Entry in the per-invoice recipient verification audit log.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RecipientAuthLogEntry {
+    pub recipient: Address,
+    pub action: Symbol,
+    pub actor: Address,
+    pub timestamp: u64,
+    pub ledger: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::InvoiceStatus;
