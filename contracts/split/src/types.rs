@@ -1653,6 +1653,74 @@ pub struct ComputeEstimate {
     pub fee_stroops: i128,
 }
 
+/// Issue #924: Linear cost model for one operation.
+///
+/// `cpu = base_insns + recipients * per_recipient_insns + payers * per_payer_insns
+///        + items * per_item_insns`
+/// `mem = base_mem_bytes + (recipients + payers + items) * per_unit_mem_bytes`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationCostModel {
+    pub base_insns: u64,
+    pub per_recipient_insns: u64,
+    pub per_payer_insns: u64,
+    pub per_item_insns: u64,
+    pub base_mem_bytes: u64,
+    pub per_unit_mem_bytes: u64,
+}
+
+/// Issue #924: Result of `estimate_operation_cost`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CostEstimate {
+    pub operation: Symbol,
+    /// Calibrated instruction estimate (raw estimate scaled by `calibration_bps`).
+    pub cpu_insns: u64,
+    /// Uncalibrated instruction estimate straight from the cost model.
+    pub raw_cpu_insns: u64,
+    pub mem_bytes: u64,
+    pub fee_stroops: i128,
+    /// Observed actual / raw estimate ratio in basis points (10_000 = model is exact).
+    pub calibration_bps: u32,
+    pub within_budget: bool,
+    /// True when served from the estimate cache.
+    pub cached: bool,
+    /// Cost model version the estimate was computed against.
+    pub model_version: u32,
+}
+
+/// Issue #924: Per-operation profiling data built from reported actual usage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationProfile {
+    pub operation: Symbol,
+    pub samples: u32,
+    pub total_raw_estimated_insns: u64,
+    pub total_actual_insns: u64,
+    pub min_actual_insns: u64,
+    pub max_actual_insns: u64,
+    pub last_actual_insns: u64,
+    /// Error of the calibrated estimate for the last sample, in basis points of actual.
+    pub last_error_bps: u32,
+    /// Samples whose calibrated estimate was within 10% of actual.
+    pub within_tolerance: u32,
+}
+
+/// Issue #924: One row of `get_compute_cost_report`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationCostReport {
+    pub operation: Symbol,
+    pub samples: u32,
+    pub avg_actual_insns: u64,
+    pub avg_raw_estimated_insns: u64,
+    pub min_actual_insns: u64,
+    pub max_actual_insns: u64,
+    pub calibration_bps: u32,
+    /// Share of samples estimated within 10%, in basis points.
+    pub accuracy_bps: u32,
+}
+
 /// Issue #297: Circuit breaker status returned by get_circuit_breaker_status().
 #[contracttype]
 #[derive(Clone, Debug)]

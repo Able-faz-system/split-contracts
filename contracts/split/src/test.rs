@@ -9021,3 +9021,116 @@ fn test_923_history_logs_transitions() {
     assert_eq!(history.get(2).unwrap().to, types::CircuitBreakerState::Closed);
     assert!(has_circuit_breaker_event(&env, "cb_state"));
 }
+
+// ---------------------------------------------------------------------------
+// Issue #924: Compute budget estimation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_924_estimate_uses_default_model() {
+    let (env, contract_id, _token_id, _admin) = setup_fee_waiver_admin();
+    let c = client(&env, &contract_id);
+
+    let est = c.estimate_operation_cost(&symbol_short!("release"), &4_u32, &0_u32, &0_u32);
+    let expected = INSTRUCTIONS_BASE + INSTRUCTIONS_PER_SHARD * SHARD_COUNT + 4 * INSTRUCTIONS_PER_RECIPIENT;
+    assert_eq!(est.raw_cpu_insns, expected);
+    assert_eq!(est.cpu_insns, expected, "uncalibrated estimate equals raw");
+    assert_eq!(est.calibration_bps, 10_000);
+    assert!(est.within_budget);
+    assert!(!est.cached);
+}
+
+#[test]
+fn test_924_estimate_is_cached_until_model_changes() {
+    let (env, contract_id, _token_id, admin) = setup_fee_waiver_admin();
+    let c = client(&env, &contract_id);
+    let op = symbol_short!("pay");
+
+    let first = c.estimate_operation_cost(&op, &2_u32, &0_u32, &0_u32);
+    assert!(!first.cached);
+    let second = c.estimate_operation_cost(&op, &2_u32, &0_u32, &0_u32);
+    assert!(second.cached);
+    assert_eq!(second.cpu_insns, first.cpu_insns);
+
+    c.set_operation_cost_model(
+        &admin,
+        &op,
+        &types::OperationCostModel {
+            base_insns: 10,
+            per_recipient_insns: 5,
+            per_payer_insns: 0,
+            per_item_insns: 0,
+            base_mem_bytes: 0,
+            per_unit_mem_bytes: 0,
+        },
+    );
+    let third = c.estimate_operation_cost(&op, &2_u32, &0_u32, &0_u32);
+    assert!(!third.cached, "model change must invalidate the cache");
+    assert_eq!(third.raw_cpu_insns, 20);
+}
+
+#[test]
+fn test_924_calibration_brings_estimate_within_ten_percent() {
+    let (env, contract_id, _token_id, admin) = setup_fee_waiver_admin();
+    let c = client(&env, &contract_id);
+    let op = symbol_short!("release");
+
+    let raw = c.estimate_operation_cost(&op, &3_u32, &0_u32, &0_u32).raw_cpu_insns;
+    // Real usage runs 30% above the model.
+    let actual = raw * 13 / 10;
+    c.record_compute_usage(&admin, &op, &3_u32, &0_u32, &0_u32, &actual);
+
+    let est = c.estimate_operation_cost(&op, &3_u32, &0_u32, &0_u32);
+    assert_eq!(est.calibration_bps, 13_000);
+    let error = est.cpu_insns.abs_diff(actual);
+    assert!(error * 10 <= actual, "calibrated estimate must be within 10% of actual");
+}
+
+#[test]
+fn test_924_profile_tracks_samples() {
+    let (env, contract_id, _token_id, admin) = setup_fee_waiver_admin();
+    let c = client(&env, &contract_id);
+    let op = symbol_short!("refund");
+
+    assert!(c.get_operation_profile(&op).is_none());
+    c.record_compute_usage(&admin, &op, &0_u32, &2_u32, &0_u32, &2_000_000_u64);
+    c.record_compute_usage(&admin, &op, &0_u32, &4_u32, &0_u32, &3_000_000_u64);
+
+    let p = c.get_operation_profile(&op).unwrap();
+    assert_eq!(p.samples, 2);
+    assert_eq!(p.min_actual_insns, 2_000_000);
+    assert_eq!(p.max_actual_insns, 3_000_000);
+    assert_eq!(p.last_actual_insns, 3_000_000);
+    assert_eq!(p.total_actual_insns, 5_000_000);
+}
+
+#[test]
+fn test_924_report_summarises_tracked_operations() {
+    let (env, contract_id, _token_id, admin) = setup_fee_waiver_admin();
+    let c = client(&env, &contract_id);
+    let op = symbol_short!("create");
+
+    let raw = c.estimate_operation_cost(&op, &2_u32, &0_u32, &0_u32).raw_cpu_insns;
+    c.record_compute_usage(&admin, &op, &2_u32, &0_u32, &0_u32, &raw);
+    c.record_compute_usage(&admin, &op, &2_u32, &0_u32, &0_u32, &raw);
+
+    let report = c.get_compute_cost_report();
+    assert_eq!(report.len(), 1);
+    let row = report.get(0).unwrap();
+    assert_eq!(row.operation, op);
+    assert_eq!(row.samples, 2);
+    assert_eq!(row.avg_actual_insns, raw);
+    assert_eq!(row.calibration_bps, 10_000);
+    assert_eq!(row.accuracy_bps, 10_000);
+
+    c.reset_operation_profile(&admin, &op);
+    assert_eq!(c.get_compute_cost_report().len(), 0);
+}
+
+#[test]
+#[should_panic(expected = "unknown operation")]
+fn test_924_unknown_operation_rejected() {
+    let (env, contract_id, _token_id, _admin) = setup_fee_waiver_admin();
+    let c = client(&env, &contract_id);
+    c.estimate_operation_cost(&symbol_short!("nope"), &1_u32, &0_u32, &0_u32);
+}

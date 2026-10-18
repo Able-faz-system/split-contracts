@@ -35,6 +35,11 @@ const INSTRUCTIONS_BASE: u64 = 1_000_000;
 /// Issue #298: Stroops per 10_000 instructions (rough estimate based on Soroban fee schedule).
 const STROOPS_PER_10K_INSTRUCTIONS: u64 = 1;
 
+/// Issue #924: Estimate counted as accurate when within this error of actual (10%).
+const COST_ESTIMATE_TOLERANCE_BPS: u64 = 1_000;
+/// Issue #924: Maximum distinct operations tracked by the profiler.
+const MAX_PROFILED_OPERATIONS: u32 = 32;
+
 /// Issue #296: Maximum entries in the per-creator fee waiver list.
 const MAX_FEE_WAIVER_ENTRIES: usize = 100;
 /// Issue #922: Maximum entries retained in the fee waiver audit log (oldest dropped first).
@@ -99,7 +104,8 @@ const MAX_PARENT_DEPTH: u32 = 10;
 
 use types::{
     AdminAction, AdminRole, AdminSet, AuditEntry, Bid, CircuitBreakerConfig, CircuitBreakerState,
-    CircuitBreakerStatus, CircuitBreakerTransition,
+    CircuitBreakerStatus, CircuitBreakerTransition, CostEstimate, OperationCostModel,
+    OperationCostReport, OperationProfile,
     CloneOverrides, CompactInvoice, CompactMigrateResult, CompletionProof, ComputeEstimate,
     ConfidentialPayment, ContributionResult, CreateInvoiceParams, CreatorStats, DelayedPayout,
     DisputeOutcome, DisputeRecord, DisputeStatus, FeeBracket, FeeSplit, FeeTier, FeeWaiver,
@@ -247,6 +253,36 @@ fn circuit_breaker_recovery_key() -> Symbol {
 /// Issue #923: Bounded history of state transitions.
 fn circuit_breaker_history_key() -> Symbol {
     symbol_short!("cb_hist")
+}
+
+/// Issue #924: Admin-configured cost model override for an operation.
+fn cost_model_key(operation: &Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("cost_mdl"), operation.clone())
+}
+
+/// Issue #924: Version counter bumped whenever a model or calibration changes.
+fn cost_model_version_key() -> Symbol {
+    symbol_short!("cost_ver")
+}
+
+/// Issue #924: Per-operation profiling data.
+fn cost_profile_key(operation: &Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("cost_prf"), operation.clone())
+}
+
+/// Issue #924: Operations that have profiling data.
+fn cost_profiled_ops_key() -> Symbol {
+    symbol_short!("cost_ops")
+}
+
+/// Issue #924: Cached estimate per (operation, recipients, payers, items) — temporary storage.
+fn cost_cache_key(
+    operation: &Symbol,
+    recipients: u32,
+    payers: u32,
+    items: u32,
+) -> (Symbol, Symbol, u32, u32, u32) {
+    (symbol_short!("cost_c"), operation.clone(), recipients, payers, items)
 }
 
 /// Issue #295: Confidential payment storage key per (invoice_id, payer).
@@ -2368,6 +2404,141 @@ fn require_fn_not_paused(env: &Env, name: &Symbol) {
         .unwrap_or_else(|| Vec::new(env));
     if paused_fns.iter().any(|f| f == *name) {
         panic!("function paused");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #924: Compute cost estimation helpers
+// ---------------------------------------------------------------------------
+
+/// Built-in cost models, derived from the `estimate_compute` constants.
+fn default_cost_model(operation: &Symbol) -> Option<OperationCostModel> {
+    let shard_overhead = INSTRUCTIONS_PER_SHARD * SHARD_COUNT;
+    let model = if *operation == symbol_short!("create") {
+        OperationCostModel {
+            base_insns: INSTRUCTIONS_BASE,
+            per_recipient_insns: 200_000,
+            per_payer_insns: 0,
+            per_item_insns: 0,
+            base_mem_bytes: 128 * 1024,
+            per_unit_mem_bytes: 64 * 1024,
+        }
+    } else if *operation == symbol_short!("pay") {
+        OperationCostModel {
+            base_insns: INSTRUCTIONS_BASE + shard_overhead,
+            per_recipient_insns: INSTRUCTIONS_PER_RECIPIENT / 2,
+            per_payer_insns: 0,
+            per_item_insns: 0,
+            base_mem_bytes: 256 * 1024,
+            per_unit_mem_bytes: 16 * 1024,
+        }
+    } else if *operation == symbol_short!("release") {
+        OperationCostModel {
+            base_insns: INSTRUCTIONS_BASE + shard_overhead,
+            per_recipient_insns: INSTRUCTIONS_PER_RECIPIENT,
+            per_payer_insns: 0,
+            per_item_insns: 0,
+            base_mem_bytes: 256 * 1024,
+            per_unit_mem_bytes: 32 * 1024,
+        }
+    } else if *operation == symbol_short!("refund") {
+        OperationCostModel {
+            base_insns: INSTRUCTIONS_BASE + shard_overhead,
+            per_recipient_insns: 0,
+            per_payer_insns: 350_000,
+            per_item_insns: 0,
+            base_mem_bytes: 256 * 1024,
+            per_unit_mem_bytes: 32 * 1024,
+        }
+    } else if *operation == symbol_short!("batch_pay") {
+        // One token transfer + setup, then internal accounting per batched invoice.
+        OperationCostModel {
+            base_insns: INSTRUCTIONS_BASE + shard_overhead,
+            per_recipient_insns: 0,
+            per_payer_insns: 0,
+            per_item_insns: 400_000,
+            base_mem_bytes: 256 * 1024,
+            per_unit_mem_bytes: 32 * 1024,
+        }
+    } else {
+        return None;
+    };
+    Some(model)
+}
+
+fn load_cost_model(env: &Env, operation: &Symbol) -> OperationCostModel {
+    env.storage()
+        .persistent()
+        .get(&cost_model_key(operation))
+        .or_else(|| default_cost_model(operation))
+        .expect("unknown operation")
+}
+
+fn cost_model_version(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&cost_model_version_key())
+        .unwrap_or(0)
+}
+
+fn bump_cost_model_version(env: &Env) {
+    let next = cost_model_version(env).wrapping_add(1);
+    env.storage()
+        .persistent()
+        .set(&cost_model_version_key(), &next);
+}
+
+fn load_operation_profile(env: &Env, operation: &Symbol) -> Option<OperationProfile> {
+    env.storage().persistent().get(&cost_profile_key(operation))
+}
+
+/// actual / raw-estimate ratio from profiling data, in bps (10_000 when unprofiled).
+fn cost_calibration_bps(profile: &Option<OperationProfile>) -> u32 {
+    match profile {
+        Some(p) if p.total_raw_estimated_insns > 0 => {
+            let bps = (p.total_actual_insns as u128) * 10_000
+                / (p.total_raw_estimated_insns as u128);
+            bps.min(u32::MAX as u128) as u32
+        }
+        _ => 10_000,
+    }
+}
+
+fn raw_cost_insns(model: &OperationCostModel, recipients: u32, payers: u32, items: u32) -> u64 {
+    model
+        .base_insns
+        .saturating_add((recipients as u64).saturating_mul(model.per_recipient_insns))
+        .saturating_add((payers as u64).saturating_mul(model.per_payer_insns))
+        .saturating_add((items as u64).saturating_mul(model.per_item_insns))
+}
+
+/// Compute an estimate from the current model and calibration (no caching).
+fn compute_cost_estimate(
+    env: &Env,
+    operation: &Symbol,
+    recipients: u32,
+    payers: u32,
+    items: u32,
+) -> CostEstimate {
+    let model = load_cost_model(env, operation);
+    let raw_cpu_insns = raw_cost_insns(&model, recipients, payers, items);
+    let calibration_bps = cost_calibration_bps(&load_operation_profile(env, operation));
+    let cpu_insns = ((raw_cpu_insns as u128) * (calibration_bps as u128) / 10_000)
+        .min(u64::MAX as u128) as u64;
+    let units = (recipients as u64) + (payers as u64) + (items as u64);
+    let mem_bytes = model
+        .base_mem_bytes
+        .saturating_add(units.saturating_mul(model.per_unit_mem_bytes));
+    CostEstimate {
+        operation: operation.clone(),
+        cpu_insns,
+        raw_cpu_insns,
+        mem_bytes,
+        fee_stroops: (cpu_insns as i128 / 10_000) * STROOPS_PER_10K_INSTRUCTIONS as i128,
+        calibration_bps,
+        within_budget: cpu_insns <= INSTRUCTION_BUDGET_LIMIT,
+        cached: false,
+        model_version: cost_model_version(env),
     }
 }
 
@@ -14010,6 +14181,183 @@ impl SplitContract {
             estimated_fee_stroops,
             would_succeed,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #924: Runtime compute cost estimation, tracking and profiling
+    // -----------------------------------------------------------------------
+
+    /// Estimate the cost of `operation` (`create`, `pay`, `release`, `refund`,
+    /// `batch_pay`, or any operation with an admin-defined model).
+    ///
+    /// The raw model estimate is scaled by the calibration learned from
+    /// `record_compute_usage`. Results are cached in temporary storage and
+    /// invalidated whenever a model or calibration changes.
+    pub fn estimate_operation_cost(
+        env: Env,
+        operation: Symbol,
+        recipient_count: u32,
+        payer_count: u32,
+        item_count: u32,
+    ) -> CostEstimate {
+        let key = cost_cache_key(&operation, recipient_count, payer_count, item_count);
+        let version = cost_model_version(&env);
+        if let Some(mut cached) = env.storage().temporary().get::<_, CostEstimate>(&key) {
+            if cached.model_version == version {
+                cached.cached = true;
+                return cached;
+            }
+        }
+        let estimate =
+            compute_cost_estimate(&env, &operation, recipient_count, payer_count, item_count);
+        env.storage().temporary().set(&key, &estimate);
+        estimate
+    }
+
+    /// Report the measured instruction count of an executed operation. Operator+ only.
+    ///
+    /// Updates the operation's profile (min / max / last / totals), scores the
+    /// current calibrated estimate against the measurement, and refreshes the
+    /// calibration used by future estimates.
+    pub fn record_compute_usage(
+        env: Env,
+        reporter: Address,
+        operation: Symbol,
+        recipient_count: u32,
+        payer_count: u32,
+        item_count: u32,
+        actual_insns: u64,
+    ) -> OperationProfile {
+        require_admin_role(&env, &reporter, AdminRole::Operator);
+        assert!(actual_insns > 0, "actual instructions must be positive");
+
+        let estimate =
+            compute_cost_estimate(&env, &operation, recipient_count, payer_count, item_count);
+        let error = estimate.cpu_insns.abs_diff(actual_insns);
+        let error_bps = ((error as u128) * 10_000 / (actual_insns as u128)).min(u32::MAX as u128)
+            as u32;
+
+        let mut profile = load_operation_profile(&env, &operation).unwrap_or(OperationProfile {
+            operation: operation.clone(),
+            samples: 0,
+            total_raw_estimated_insns: 0,
+            total_actual_insns: 0,
+            min_actual_insns: u64::MAX,
+            max_actual_insns: 0,
+            last_actual_insns: 0,
+            last_error_bps: 0,
+            within_tolerance: 0,
+        });
+        if profile.samples == 0 {
+            let mut ops: Vec<Symbol> = env
+                .storage()
+                .persistent()
+                .get(&cost_profiled_ops_key())
+                .unwrap_or_else(|| Vec::new(&env));
+            if !ops.iter().any(|o| o == operation) {
+                assert!(ops.len() < MAX_PROFILED_OPERATIONS, "too many profiled operations");
+                ops.push_back(operation.clone());
+                env.storage().persistent().set(&cost_profiled_ops_key(), &ops);
+            }
+        }
+        profile.samples = profile.samples.saturating_add(1);
+        profile.total_raw_estimated_insns = profile
+            .total_raw_estimated_insns
+            .saturating_add(estimate.raw_cpu_insns);
+        profile.total_actual_insns = profile.total_actual_insns.saturating_add(actual_insns);
+        profile.min_actual_insns = profile.min_actual_insns.min(actual_insns);
+        profile.max_actual_insns = profile.max_actual_insns.max(actual_insns);
+        profile.last_actual_insns = actual_insns;
+        profile.last_error_bps = error_bps;
+        if (error_bps as u64) <= COST_ESTIMATE_TOLERANCE_BPS {
+            profile.within_tolerance = profile.within_tolerance.saturating_add(1);
+        }
+        env.storage()
+            .persistent()
+            .set(&cost_profile_key(&operation), &profile);
+        bump_cost_model_version(&env);
+
+        env.events().publish(
+            (symbol_short!("split"), symbol_short!("cost_rec"), operation),
+            (actual_insns, estimate.cpu_insns, error_bps),
+        );
+        profile
+    }
+
+    /// Override the cost model for an operation (or define a new one). SuperAdmin only.
+    /// Invalidates every cached estimate.
+    pub fn set_operation_cost_model(
+        env: Env,
+        admin: Address,
+        operation: Symbol,
+        model: OperationCostModel,
+    ) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        env.storage()
+            .persistent()
+            .set(&cost_model_key(&operation), &model);
+        bump_cost_model_version(&env);
+    }
+
+    /// Returns the cost model in effect for an operation. Panics on unknown operations.
+    pub fn get_operation_cost_model(env: Env, operation: Symbol) -> OperationCostModel {
+        load_cost_model(&env, &operation)
+    }
+
+    /// Returns the profiling data for an operation, if any usage has been recorded.
+    pub fn get_operation_profile(env: Env, operation: Symbol) -> Option<OperationProfile> {
+        load_operation_profile(&env, &operation)
+    }
+
+    /// Clear the profiling data (and so the calibration) of an operation. SuperAdmin only.
+    pub fn reset_operation_profile(env: Env, admin: Address, operation: Symbol) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        env.storage()
+            .persistent()
+            .remove(&cost_profile_key(&operation));
+        let ops: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&cost_profiled_ops_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut kept: Vec<Symbol> = Vec::new(&env);
+        for o in ops.iter() {
+            if o != operation {
+                kept.push_back(o);
+            }
+        }
+        env.storage().persistent().set(&cost_profiled_ops_key(), &kept);
+        bump_cost_model_version(&env);
+    }
+
+    /// Summarise profiling data for every tracked operation.
+    pub fn get_compute_cost_report(env: Env) -> Vec<OperationCostReport> {
+        let ops: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&cost_profiled_ops_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut report: Vec<OperationCostReport> = Vec::new(&env);
+        for operation in ops.iter() {
+            let profile = load_operation_profile(&env, &operation);
+            if let Some(p) = profile.clone() {
+                if p.samples == 0 {
+                    continue;
+                }
+                let samples = p.samples as u64;
+                report.push_back(OperationCostReport {
+                    operation: operation.clone(),
+                    samples: p.samples,
+                    avg_actual_insns: p.total_actual_insns / samples,
+                    avg_raw_estimated_insns: p.total_raw_estimated_insns / samples,
+                    min_actual_insns: p.min_actual_insns,
+                    max_actual_insns: p.max_actual_insns,
+                    calibration_bps: cost_calibration_bps(&profile),
+                    accuracy_bps: ((p.within_tolerance as u64) * 10_000 / samples) as u32,
+                });
+            }
+        }
+        report
     }
 
     // -----------------------------------------------------------------------
