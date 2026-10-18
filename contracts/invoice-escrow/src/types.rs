@@ -165,3 +165,74 @@ pub struct CosignerApproval {
     /// Ledger sequence of the most recent change to this record.
     pub updated_ledger: u32,
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Oracle condition guard types
+// ──────────────────────────────────────────────────────────────────────
+
+/// Price observation returned by an oracle's `lastprice`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PriceData {
+    /// Price in the oracle's fixed-point units. Must be positive.
+    pub price: i128,
+    /// Unix timestamp at which the price was observed.
+    pub timestamp: u64,
+}
+
+/// How the observed price is compared against `threshold_price`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PriceComparator {
+    /// Condition holds when `price >= threshold_price`.
+    GreaterOrEqual,
+    /// Condition holds when `price <= threshold_price`.
+    LessOrEqual,
+}
+
+/// Which oracle produced a reading.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum OracleSource {
+    Primary,
+    Fallback,
+}
+
+/// Price condition that must hold before an invoice can be released.
+///
+/// The `oracle` is queried first. If it is unavailable, returns an invalid
+/// price, or returns a price older than `max_staleness_secs`, the optional
+/// `fallback_oracle` is queried instead. If neither yields a usable price the
+/// release is blocked with the corresponding oracle error.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct OracleCondition {
+    /// Primary oracle contract.
+    pub oracle: Address,
+    /// Secondary oracle consulted when the primary fails.
+    pub fallback_oracle: Option<Address>,
+    /// Asset whose price is checked.
+    pub asset: Address,
+    /// Comparison applied to the observed price.
+    pub comparator: PriceComparator,
+    /// Price the observation is compared against. Must be positive.
+    pub threshold_price: i128,
+    /// Maximum accepted age (seconds) of an oracle price.
+    pub max_staleness_secs: u64,
+}
+
+/// Result of evaluating an [`OracleCondition`].
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct OracleReading {
+    /// Price used for the evaluation.
+    pub price: i128,
+    /// Timestamp reported by the oracle for `price`.
+    pub price_timestamp: u64,
+    /// Oracle that supplied the price.
+    pub source: OracleSource,
+    /// Whether the condition held for `price`.
+    pub condition_met: bool,
+    /// Ledger timestamp at which the evaluation happened.
+    pub checked_at: u64,
+}

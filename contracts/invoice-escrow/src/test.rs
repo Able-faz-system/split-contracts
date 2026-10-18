@@ -1170,3 +1170,329 @@ mod cosigner_tests {
         assert!(has_topic(symbol_short!("appr_stat")));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Oracle condition guards (#915)
+// ---------------------------------------------------------------------------
+
+mod oracle_tests {
+    use super::*;
+    use crate::types::{OracleCondition, OracleSource, PriceComparator, PriceData};
+    use soroban_sdk::{contract, contractimpl, Symbol, TryFromVal};
+
+    /// Configurable oracle: returns whatever `set_price` last stored.
+    #[contract]
+    pub struct MockOracle;
+
+    #[contractimpl]
+    impl MockOracle {
+        pub fn set_price(env: Env, price: Option<PriceData>) {
+            env.storage().instance().set(&symbol_short!("price"), &price);
+        }
+
+        pub fn lastprice(env: Env, _asset: Address) -> Option<PriceData> {
+            env.storage()
+                .instance()
+                .get::<_, Option<PriceData>>(&symbol_short!("price"))
+                .flatten()
+        }
+    }
+
+    /// Oracle that always traps, simulating an unreachable feed.
+    #[contract]
+    pub struct BrokenOracle;
+
+    #[contractimpl]
+    impl BrokenOracle {
+        pub fn lastprice(_env: Env, _asset: Address) -> Option<PriceData> {
+            panic!("oracle offline")
+        }
+    }
+
+    struct Ctx {
+        env: Env,
+        contract_id: Address,
+        payer: Address,
+        asset: Address,
+        id: u64,
+    }
+
+    impl Ctx {
+        fn client(&self) -> InvoiceEscrowContractClient<'_> {
+            InvoiceEscrowContractClient::new(&self.env, &self.contract_id)
+        }
+    }
+
+    const NOW: u64 = 1_000_000;
+
+    fn setup_invoice() -> Ctx {
+        let (env, contract_id) = setup();
+        env.ledger().with_mut(|li| li.timestamp = NOW);
+        let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = create_token(&env, &token_admin);
+        mint(&env, &token, &token_admin, &payer, 10_000);
+
+        client.initialize(&admin);
+        let id = client.create_invoice(&creator, &token, &1_000, &(NOW + 10_000));
+        Ctx { env, contract_id, payer, asset: Address::generate(&env), id }
+    }
+
+    fn mock_oracle(env: &Env, price: Option<PriceData>) -> Address {
+        let id = env.register_contract(None, MockOracle);
+        MockOracleClient::new(env, &id).set_price(&price);
+        id
+    }
+
+    fn price(p: i128, ts: u64) -> Option<PriceData> {
+        Some(PriceData { price: p, timestamp: ts })
+    }
+
+    fn condition(ctx: &Ctx, oracle: &Address, fallback: Option<Address>) -> OracleCondition {
+        OracleCondition {
+            oracle: oracle.clone(),
+            fallback_oracle: fallback,
+            asset: ctx.asset.clone(),
+            comparator: PriceComparator::GreaterOrEqual,
+            threshold_price: 100,
+            max_staleness_secs: 300,
+        }
+    }
+
+    #[test]
+    fn test_set_oracle_condition_stores_condition() {
+        let ctx = setup_invoice();
+        let oracle = mock_oracle(&ctx.env, price(150, NOW));
+        let client = ctx.client();
+        client.set_oracle_condition(&ctx.id, &condition(&ctx, &oracle, None));
+
+        let stored = client.get_oracle_condition(&ctx.id).unwrap();
+        assert_eq!(stored.oracle, oracle);
+        assert_eq!(stored.threshold_price, 100);
+    }
+
+    #[test]
+    fn test_set_oracle_condition_invalid_config() {
+        let ctx = setup_invoice();
+        let oracle = mock_oracle(&ctx.env, None);
+        let client = ctx.client();
+
+        let mut c = condition(&ctx, &oracle, None);
+        c.threshold_price = 0;
+        assert_eq!(client.try_set_oracle_condition(&ctx.id, &c), Err(Ok(Error::InvalidOracleConfig)));
+
+        let mut c = condition(&ctx, &oracle, None);
+        c.max_staleness_secs = 0;
+        assert_eq!(client.try_set_oracle_condition(&ctx.id, &c), Err(Ok(Error::InvalidOracleConfig)));
+
+        let c = condition(&ctx, &oracle, Some(oracle.clone()));
+        assert_eq!(client.try_set_oracle_condition(&ctx.id, &c), Err(Ok(Error::InvalidOracleConfig)));
+    }
+
+    #[test]
+    fn test_set_oracle_condition_locked_after_deposit() {
+        let ctx = setup_invoice();
+        let oracle = mock_oracle(&ctx.env, price(150, NOW));
+        let client = ctx.client();
+        client.deposit(&ctx.payer, &ctx.id, &100);
+        assert_eq!(
+            client.try_set_oracle_condition(&ctx.id, &condition(&ctx, &oracle, None)),
+            Err(Ok(Error::InvalidStatus))
+        );
+    }
+
+    #[test]
+    fn test_condition_met_allows_auto_release() {
+        let ctx = setup_invoice();
+        let oracle = mock_oracle(&ctx.env, price(150, NOW - 10));
+        let client = ctx.client();
+        client.set_oracle_condition(&ctx.id, &condition(&ctx, &oracle, None));
+
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Released);
+
+        let reading = client.get_last_oracle_reading(&ctx.id).unwrap();
+        assert_eq!(reading.price, 150);
+        assert_eq!(reading.source, OracleSource::Primary);
+        assert!(reading.condition_met);
+    }
+
+    #[test]
+    fn test_condition_not_met_blocks_release_until_price_moves() {
+        let ctx = setup_invoice();
+        let oracle = mock_oracle(&ctx.env, price(50, NOW));
+        let client = ctx.client();
+        client.set_oracle_condition(&ctx.id, &condition(&ctx, &oracle, None));
+
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Active);
+        assert!(!client.get_last_oracle_reading(&ctx.id).unwrap().condition_met);
+        assert_eq!(client.try_release(&ctx.id), Err(Ok(Error::OracleConditionNotMet)));
+
+        MockOracleClient::new(&ctx.env, &oracle).set_price(&price(100, NOW));
+        client.release(&ctx.id);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Released);
+    }
+
+    #[test]
+    fn test_less_or_equal_comparator() {
+        let ctx = setup_invoice();
+        let oracle = mock_oracle(&ctx.env, price(150, NOW));
+        let client = ctx.client();
+        let mut c = condition(&ctx, &oracle, None);
+        c.comparator = PriceComparator::LessOrEqual;
+        client.set_oracle_condition(&ctx.id, &c);
+
+        assert!(!client.check_oracle_condition(&ctx.id).condition_met);
+        MockOracleClient::new(&ctx.env, &oracle).set_price(&price(100, NOW));
+        assert!(client.check_oracle_condition(&ctx.id).condition_met);
+    }
+
+    #[test]
+    fn test_stale_price_rejected() {
+        let ctx = setup_invoice();
+        let oracle = mock_oracle(&ctx.env, price(150, NOW - 301));
+        let client = ctx.client();
+        client.set_oracle_condition(&ctx.id, &condition(&ctx, &oracle, None));
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+
+        assert_eq!(client.try_release(&ctx.id), Err(Ok(Error::OracleStalePrice)));
+        assert_eq!(client.try_check_oracle_condition(&ctx.id), Err(Ok(Error::OracleStalePrice)));
+    }
+
+    #[test]
+    fn test_invalid_prices_rejected() {
+        let ctx = setup_invoice();
+        let oracle = mock_oracle(&ctx.env, price(0, NOW));
+        let client = ctx.client();
+        client.set_oracle_condition(&ctx.id, &condition(&ctx, &oracle, None));
+        assert_eq!(client.try_check_oracle_condition(&ctx.id), Err(Ok(Error::OracleInvalidPrice)));
+
+        // Future-dated price.
+        MockOracleClient::new(&ctx.env, &oracle).set_price(&price(150, NOW + 1));
+        assert_eq!(client.try_check_oracle_condition(&ctx.id), Err(Ok(Error::OracleInvalidPrice)));
+    }
+
+    #[test]
+    fn test_missing_price_is_unavailable() {
+        let ctx = setup_invoice();
+        let oracle = mock_oracle(&ctx.env, None);
+        let client = ctx.client();
+        client.set_oracle_condition(&ctx.id, &condition(&ctx, &oracle, None));
+        assert_eq!(client.try_check_oracle_condition(&ctx.id), Err(Ok(Error::OracleUnavailable)));
+    }
+
+    #[test]
+    fn test_broken_oracle_does_not_abort_deposit() {
+        let ctx = setup_invoice();
+        let broken = ctx.env.register_contract(None, BrokenOracle);
+        let client = ctx.client();
+        client.set_oracle_condition(&ctx.id, &condition(&ctx, &broken, None));
+
+        // Deposit still succeeds; release is simply deferred.
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+        let invoice = client.get_invoice(&ctx.id);
+        assert_eq!(invoice.status, EscrowStatus::Active);
+        assert_eq!(invoice.funded_amount, 1_000);
+        assert_eq!(client.try_release(&ctx.id), Err(Ok(Error::OracleUnavailable)));
+    }
+
+    #[test]
+    fn test_fallback_used_when_primary_broken() {
+        let ctx = setup_invoice();
+        let broken = ctx.env.register_contract(None, BrokenOracle);
+        let fallback = mock_oracle(&ctx.env, price(200, NOW));
+        let client = ctx.client();
+        client.set_oracle_condition(&ctx.id, &condition(&ctx, &broken, Some(fallback)));
+
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Released);
+        let reading = client.get_last_oracle_reading(&ctx.id).unwrap();
+        assert_eq!(reading.source, OracleSource::Fallback);
+        assert_eq!(reading.price, 200);
+    }
+
+    #[test]
+    fn test_fallback_used_when_primary_stale() {
+        let ctx = setup_invoice();
+        let primary = mock_oracle(&ctx.env, price(150, NOW - 1_000));
+        let fallback = mock_oracle(&ctx.env, price(120, NOW));
+        let client = ctx.client();
+        client.set_oracle_condition(&ctx.id, &condition(&ctx, &primary, Some(fallback)));
+
+        let reading = client.check_oracle_condition(&ctx.id);
+        assert_eq!(reading.source, OracleSource::Fallback);
+        assert_eq!(reading.price, 120);
+
+        let events = ctx.env.events().all();
+        let fallback_emitted = events.events().iter().any(|e| {
+            xdr_event_topics(&ctx.env, e)
+                .map(|t| {
+                    t.len() >= 2
+                        && Symbol::try_from_val(&ctx.env, &t.get(1).unwrap())
+                            .map_or(false, |sym| sym == symbol_short!("orc_fback"))
+                })
+                .unwrap_or(false)
+        });
+        assert!(fallback_emitted, "orc_fback event not emitted");
+    }
+
+    #[test]
+    fn test_both_oracles_failing_blocks_release() {
+        let ctx = setup_invoice();
+        let broken = ctx.env.register_contract(None, BrokenOracle);
+        let stale = mock_oracle(&ctx.env, price(150, NOW - 1_000));
+        let client = ctx.client();
+        client.set_oracle_condition(&ctx.id, &condition(&ctx, &broken, Some(stale)));
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+
+        // Error reported is the fallback's (last oracle tried).
+        assert_eq!(client.try_release(&ctx.id), Err(Ok(Error::OracleStalePrice)));
+    }
+
+    #[test]
+    fn test_primary_preferred_over_fallback() {
+        let ctx = setup_invoice();
+        let primary = mock_oracle(&ctx.env, price(150, NOW));
+        let fallback = mock_oracle(&ctx.env, price(50, NOW));
+        let client = ctx.client();
+        client.set_oracle_condition(&ctx.id, &condition(&ctx, &primary, Some(fallback)));
+
+        let reading = client.check_oracle_condition(&ctx.id);
+        assert_eq!(reading.source, OracleSource::Primary);
+        assert!(reading.condition_met);
+    }
+
+    #[test]
+    fn test_admin_clear_condition_unblocks_release() {
+        let ctx = setup_invoice();
+        let broken = ctx.env.register_contract(None, BrokenOracle);
+        let client = ctx.client();
+        client.set_oracle_condition(&ctx.id, &condition(&ctx, &broken, None));
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+        assert_eq!(client.try_release(&ctx.id), Err(Ok(Error::OracleUnavailable)));
+
+        client.clear_oracle_condition(&ctx.id);
+        assert!(client.get_oracle_condition(&ctx.id).is_none());
+        client.release(&ctx.id);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Released);
+
+        assert_eq!(client.try_clear_oracle_condition(&ctx.id), Err(Ok(Error::InvalidStatus)));
+    }
+
+    #[test]
+    fn test_clear_without_condition_fails() {
+        let ctx = setup_invoice();
+        assert_eq!(
+            ctx.client().try_clear_oracle_condition(&ctx.id),
+            Err(Ok(Error::NoOracleCondition))
+        );
+        assert_eq!(
+            ctx.client().try_check_oracle_condition(&ctx.id),
+            Err(Ok(Error::NoOracleCondition))
+        );
+    }
+}

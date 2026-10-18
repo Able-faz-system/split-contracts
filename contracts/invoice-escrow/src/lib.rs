@@ -6,6 +6,8 @@
 //! - Deadline-based refund fallback
 //! - **Upgradable admin authority** via a two-step `transfer_admin` flow
 //! - **Co-signer approval**: optional N-of-M sign-off gating release
+//! - **Oracle condition guards**: optional price-feed condition, with a
+//!   fallback oracle, that must hold before release
 //!
 //! # Admin Transfer Flow
 //!
@@ -19,6 +21,7 @@
 #![no_std]
 
 mod errors;
+mod oracle;
 mod types;
 
 #[cfg(test)]
@@ -28,8 +31,10 @@ use errors::Error;
 use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, BytesN, Env, Symbol, Vec,
 };
+use oracle::PriceOracleClient;
 use types::{
     ApprovalStatus, BlacklistEntry, CosignerApproval, EscrowInvoice, EscrowReleased, EscrowStatus,
+    OracleCondition, OracleReading, OracleSource, PriceComparator, PriceData,
 };
 
 // ---------------------------------------------------------------------------
@@ -69,6 +74,16 @@ fn blacklist_key(payer: &Address) -> (Symbol, Address) {
 /// Persistent storage: co-signer approval record for an invoice.
 fn approval_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("approval"), id)
+}
+
+/// Persistent storage: oracle release condition for an invoice.
+fn oracle_cond_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("orc_cond"), id)
+}
+
+/// Persistent storage: most recent successful oracle evaluation for an invoice.
+fn oracle_read_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("orc_read"), id)
 }
 
 // ---------------------------------------------------------------------------
@@ -134,14 +149,78 @@ fn recompute_approval_status(approval: &mut CosignerApproval) {
     };
 }
 
+fn get_oracle_condition(env: &Env, id: u64) -> Option<OracleCondition> {
+    env.storage().persistent().get(&oracle_cond_key(id))
+}
+
+/// Query a single oracle and validate the returned price.
+///
+/// Uses `try_lastprice` so that a panicking, missing or incompatible oracle
+/// contract surfaces as [`Error::OracleUnavailable`] instead of aborting.
+fn read_oracle(env: &Env, oracle: &Address, asset: &Address, max_staleness_secs: u64) -> Result<PriceData, Error> {
+    let client = PriceOracleClient::new(env, oracle);
+    let data = match client.try_lastprice(asset) {
+        Ok(Ok(Some(data))) => data,
+        _ => return Err(Error::OracleUnavailable),
+    };
+
+    let now = env.ledger().timestamp();
+    if data.price <= 0 || data.timestamp > now {
+        return Err(Error::OracleInvalidPrice);
+    }
+    if now - data.timestamp > max_staleness_secs {
+        return Err(Error::OracleStalePrice);
+    }
+    Ok(data)
+}
+
+/// Evaluate an oracle condition, falling back to the secondary oracle when
+/// the primary cannot supply a usable price.
+///
+/// When both oracles fail, the error from the last oracle tried is returned
+/// (the fallback's if one is configured, otherwise the primary's).
+fn evaluate_oracle_condition(env: &Env, id: u64, cond: &OracleCondition) -> Result<OracleReading, Error> {
+    let (data, source) = match read_oracle(env, &cond.oracle, &cond.asset, cond.max_staleness_secs) {
+        Ok(data) => (data, OracleSource::Primary),
+        Err(primary_err) => {
+            let fallback = cond.fallback_oracle.as_ref().ok_or(primary_err)?;
+            emit_oracle_fallback(env, id, primary_err);
+            let data = read_oracle(env, fallback, &cond.asset, cond.max_staleness_secs)?;
+            (data, OracleSource::Fallback)
+        }
+    };
+
+    let condition_met = match cond.comparator {
+        PriceComparator::GreaterOrEqual => data.price >= cond.threshold_price,
+        PriceComparator::LessOrEqual => data.price <= cond.threshold_price,
+    };
+    Ok(OracleReading {
+        price: data.price,
+        price_timestamp: data.timestamp,
+        source,
+        condition_met,
+        checked_at: env.ledger().timestamp(),
+    })
+}
+
 /// Check every release gate configured on the invoice. Returns `Ok(())`
 /// when the invoice may be released now.
+///
+/// Gates are checked cheapest-first: co-signer approval, then the oracle
+/// condition (which requires a cross-contract call).
 fn check_release_gates(env: &Env, id: u64) -> Result<(), Error> {
     if let Some(approval) = get_approval(env, id) {
         match approval.status {
             ApprovalStatus::Approved => {}
             ApprovalStatus::Pending => return Err(Error::ApprovalRequired),
             ApprovalStatus::Rejected => return Err(Error::ApprovalRejected),
+        }
+    }
+    if let Some(cond) = get_oracle_condition(env, id) {
+        let reading = evaluate_oracle_condition(env, id, &cond)?;
+        env.storage().persistent().set(&oracle_read_key(id), &reading);
+        if !reading.condition_met {
+            return Err(Error::OracleConditionNotMet);
         }
     }
     Ok(())
@@ -282,6 +361,35 @@ fn emit_approval_status_changed(env: &Env, id: u64, old: &ApprovalStatus, new: &
     env.events().publish(
         (symbol_short!("escrow"), symbol_short!("appr_stat"), id),
         (old.clone(), new.clone()),
+    );
+}
+
+/// Topics: `(escrow, orc_set, id)` — Data: `(oracle, fallback_oracle, asset, threshold_price)`
+fn emit_oracle_condition_set(env: &Env, id: u64, cond: &OracleCondition) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("orc_set"), id),
+        (
+            cond.oracle.clone(),
+            cond.fallback_oracle.clone(),
+            cond.asset.clone(),
+            cond.threshold_price,
+        ),
+    );
+}
+
+/// Topics: `(escrow, orc_clear, id)` — Data: `admin`
+fn emit_oracle_condition_cleared(env: &Env, id: u64, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("orc_clear"), id),
+        admin.clone(),
+    );
+}
+
+/// Topics: `(escrow, orc_fback, id)` — Data: primary oracle error code
+fn emit_oracle_fallback(env: &Env, id: u64, primary_err: Error) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("orc_fback"), id),
+        primary_err as u32,
     );
 }
 
@@ -584,6 +692,9 @@ impl InvoiceEscrowContract {
     /// * [`Error::InsufficientFunding`] — Not fully funded yet.
     /// * [`Error::ApprovalRequired`]   — Co-signer threshold not yet reached.
     /// * [`Error::ApprovalRejected`]   — Co-signers rejected the release.
+    /// * [`Error::OracleConditionNotMet`] — Oracle price fails the condition.
+    /// * [`Error::OracleUnavailable`] / [`Error::OracleStalePrice`] /
+    ///   [`Error::OracleInvalidPrice`] — No usable oracle price.
     pub fn release(env: Env, invoice_id: u64) -> Result<(), Error> {
         let mut invoice = get_invoice(&env, invoice_id)?;
 
@@ -829,6 +940,93 @@ impl InvoiceEscrowContract {
             emit_approval_status_changed(&env, invoice_id, &old_status, &approval.status);
         }
         Ok(approval.status)
+    }
+
+    // -----------------------------------------------------------------------
+    // Oracle condition guards
+    // -----------------------------------------------------------------------
+
+    /// Attach (or replace) a price condition that must hold before release.
+    ///
+    /// Only the creator may set the condition, and only while the invoice is
+    /// still `Pending` (no deposits yet), so payers always fund against a
+    /// known condition.
+    ///
+    /// # Events
+    /// Emits `(escrow, orc_set, id)`.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`]     — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]       — Invoice already has deposits or is closed.
+    /// * [`Error::InvalidOracleConfig`] — Non-positive threshold, zero
+    ///   staleness window, or fallback equal to the primary oracle.
+    pub fn set_oracle_condition(env: Env, invoice_id: u64, condition: OracleCondition) -> Result<(), Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        invoice.creator.require_auth();
+        if invoice.status != EscrowStatus::Pending {
+            return Err(Error::InvalidStatus);
+        }
+        if condition.threshold_price <= 0
+            || condition.max_staleness_secs == 0
+            || condition.fallback_oracle.as_ref() == Some(&condition.oracle)
+        {
+            return Err(Error::InvalidOracleConfig);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&oracle_cond_key(invoice_id), &condition);
+        emit_oracle_condition_set(&env, invoice_id, &condition);
+        Ok(())
+    }
+
+    /// Admin override: remove an invoice's oracle condition.
+    ///
+    /// Intended as the last-resort fallback when both the primary and
+    /// fallback oracles are permanently unavailable, so funds are not locked
+    /// forever. Any stored reading is cleared as well.
+    ///
+    /// # Events
+    /// Emits `(escrow, orc_clear, id)` with the admin address.
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`]    — Contract not initialized.
+    /// * [`Error::InvoiceNotFound`]   — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]     — Invoice is no longer open.
+    /// * [`Error::NoOracleCondition`] — No condition to clear.
+    pub fn clear_oracle_condition(env: Env, invoice_id: u64) -> Result<(), Error> {
+        if !env.storage().instance().has(&admin_key()) {
+            return Err(Error::NotInitialized);
+        }
+        let admin = require_admin(&env);
+        let invoice = get_invoice(&env, invoice_id)?;
+        if !is_open(&invoice) {
+            return Err(Error::InvalidStatus);
+        }
+        if get_oracle_condition(&env, invoice_id).is_none() {
+            return Err(Error::NoOracleCondition);
+        }
+
+        env.storage().persistent().remove(&oracle_cond_key(invoice_id));
+        env.storage().persistent().remove(&oracle_read_key(invoice_id));
+        emit_oracle_condition_cleared(&env, invoice_id, &admin);
+        Ok(())
+    }
+
+    /// Evaluate the invoice's oracle condition now without changing state.
+    ///
+    /// Returns the reading (including whether the condition holds) or the
+    /// oracle error that would block release.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`]   — Unknown invoice ID.
+    /// * [`Error::NoOracleCondition`] — No condition configured.
+    /// * [`Error::OracleUnavailable`] / [`Error::OracleStalePrice`] /
+    ///   [`Error::OracleInvalidPrice`] — No usable oracle price.
+    pub fn check_oracle_condition(env: Env, invoice_id: u64) -> Result<OracleReading, Error> {
+        get_invoice(&env, invoice_id)?;
+        let cond = get_oracle_condition(&env, invoice_id).ok_or(Error::NoOracleCondition)?;
+        evaluate_oracle_condition(&env, invoice_id, &cond)
     }
 
     // -----------------------------------------------------------------------
@@ -1105,6 +1303,17 @@ impl InvoiceEscrowContract {
     /// (`0` when already approved or when no co-signers are configured).
     pub fn approvals_remaining(env: Env, invoice_id: u64) -> u32 {
         get_approval(&env, invoice_id).map_or(0, |a| a.threshold.saturating_sub(a.approvals.len()))
+    }
+
+    /// Return the oracle condition attached to an invoice, if any.
+    pub fn get_oracle_condition(env: Env, invoice_id: u64) -> Option<OracleCondition> {
+        get_oracle_condition(&env, invoice_id)
+    }
+
+    /// Return the last oracle reading recorded during a release attempt
+    /// (e.g. a deposit that completed funding), if any.
+    pub fn get_last_oracle_reading(env: Env, invoice_id: u64) -> Option<OracleReading> {
+        env.storage().persistent().get(&oracle_read_key(invoice_id))
     }
 
     /// Return `true` if the payer is blacklisted with a finalised and upheld entry.

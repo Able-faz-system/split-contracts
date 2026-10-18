@@ -63,4 +63,17 @@ pub enum Error {
     CosignersLocked = 26,
     /// No co-signer approval is configured for this invoice.
     NoCosigners = 27,
+    /// Oracle condition is malformed (non-positive threshold, zero staleness
+    /// window, or fallback identical to the primary oracle).
+    InvalidOracleConfig = 28,
+    /// No oracle could be reached or none returned a price for the asset.
+    OracleUnavailable = 29,
+    /// The oracle price is older than the condition's staleness window.
+    OracleStalePrice = 30,
+    /// The oracle returned a non-positive price or a future timestamp.
+    OracleInvalidPrice = 31,
+    /// The oracle price does not satisfy the release condition.
+    OracleConditionNotMet = 32,
+    /// No oracle condition is configured for this invoice.
+    NoOracleCondition = 33,
 }
