@@ -8688,3 +8688,149 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
     assert!(id3 >= 1);
 }
 
+
+// ---------------------------------------------------------------------------
+// Issue #922: Fee waiver system (expiry + audit log)
+// ---------------------------------------------------------------------------
+
+fn setup_fee_waiver_admin() -> (Env, Address, Address, Address) {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    env.ledger().set_timestamp(1_000);
+    (env, contract_id, token_id, admin)
+}
+
+#[test]
+fn test_922_grant_fee_waiver_stores_record() {
+    let (env, contract_id, _token_id, admin) = setup_fee_waiver_admin();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let reason = String::from_str(&env, "launch partner");
+
+    c.grant_fee_waiver(&admin, &creator, &5_000_u64, &reason);
+
+    assert!(c.has_fee_waiver(&creator));
+    let waiver = c.get_fee_waiver(&creator).expect("waiver record");
+    assert_eq!(waiver.creator, creator);
+    assert_eq!(waiver.granted_by, admin);
+    assert_eq!(waiver.granted_at, 1_000);
+    assert_eq!(waiver.expires_at, 5_000);
+    assert_eq!(waiver.reason, reason);
+    assert_eq!(c.list_fee_waivers().len(), 1);
+}
+
+#[test]
+fn test_922_waiver_expires_at_timestamp() {
+    let (env, contract_id, _token_id, admin) = setup_fee_waiver_admin();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+
+    c.grant_fee_waiver(&admin, &creator, &2_000_u64, &String::from_str(&env, ""));
+    assert!(c.has_fee_waiver(&creator));
+
+    env.ledger().set_timestamp(2_000);
+    assert!(!c.has_fee_waiver(&creator), "waiver must lapse at expires_at");
+    assert_eq!(c.list_fee_waivers().len(), 0);
+}
+
+#[test]
+#[should_panic(expected = "waiver expiry must be in the future")]
+fn test_922_grant_with_past_expiry_rejected() {
+    let (env, contract_id, _token_id, admin) = setup_fee_waiver_admin();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    c.grant_fee_waiver(&admin, &creator, &500_u64, &String::from_str(&env, ""));
+}
+
+#[test]
+fn test_922_purge_removes_only_expired_waivers() {
+    let (env, contract_id, _token_id, admin) = setup_fee_waiver_admin();
+    let c = client(&env, &contract_id);
+    let expiring = Address::generate(&env);
+    let permanent = Address::generate(&env);
+
+    c.grant_fee_waiver(&admin, &expiring, &1_500_u64, &String::from_str(&env, ""));
+    c.add_fee_waiver(&admin, &permanent);
+
+    env.ledger().set_timestamp(1_600);
+    let removed = c.purge_expired_fee_waivers(&Address::generate(&env));
+    assert_eq!(removed, 1);
+    assert!(c.get_fee_waiver(&expiring).is_none());
+    assert!(c.has_fee_waiver(&permanent));
+}
+
+#[test]
+fn test_922_extend_fee_waiver_updates_expiry() {
+    let (env, contract_id, _token_id, admin) = setup_fee_waiver_admin();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+
+    c.grant_fee_waiver(&admin, &creator, &2_000_u64, &String::from_str(&env, ""));
+    c.extend_fee_waiver(&admin, &creator, &9_000_u64);
+
+    env.ledger().set_timestamp(5_000);
+    assert!(c.has_fee_waiver(&creator));
+    assert_eq!(c.get_fee_waiver(&creator).unwrap().expires_at, 9_000);
+}
+
+#[test]
+fn test_922_audit_log_records_lifecycle() {
+    let (env, contract_id, _token_id, admin) = setup_fee_waiver_admin();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+
+    c.grant_fee_waiver(&admin, &creator, &2_000_u64, &String::from_str(&env, ""));
+    c.extend_fee_waiver(&admin, &creator, &3_000_u64);
+    c.remove_fee_waiver(&admin, &creator);
+
+    let log = c.get_fee_waiver_audit_log();
+    assert_eq!(log.len(), 3);
+    assert_eq!(log.get(0).unwrap().action, types::FeeWaiverAction::Granted);
+    assert_eq!(log.get(1).unwrap().action, types::FeeWaiverAction::Extended);
+    assert_eq!(log.get(2).unwrap().action, types::FeeWaiverAction::Revoked);
+    assert_eq!(log.get(2).unwrap().actor, admin);
+    assert_eq!(log.get(2).unwrap().creator, creator);
+}
+
+#[test]
+fn test_922_expired_waiver_charges_platform_fee() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &1_000_u32, &None, &0_u32, &0_u32, &0_u64);
+    c.grant_fee_waiver(&admin, &creator, &1_500_u64, &String::from_str(&env, ""));
+
+    env.ledger().set_timestamp(2_000);
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+
+    assert!(tk.balance(&recipient) < 100, "expired waiver must not zero the platform fee");
+}
+
+#[test]
+fn test_922_purge_frees_capacity_for_new_waivers() {
+    let (env, contract_id, _token_id, admin) = setup_fee_waiver_admin();
+    let c = client(&env, &contract_id);
+
+    for _ in 0..100 {
+        c.grant_fee_waiver(&admin, &Address::generate(&env), &1_500_u64, &String::from_str(&env, ""));
+    }
+    env.ledger().set_timestamp(1_600);
+    // List is full of expired entries; granting purges them first.
+    let creator = Address::generate(&env);
+    c.add_fee_waiver(&admin, &creator);
+    assert!(c.has_fee_waiver(&creator));
+    assert_eq!(c.list_fee_waivers().len(), 1);
+}

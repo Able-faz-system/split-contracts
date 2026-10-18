@@ -625,6 +625,34 @@ pub fn fee_waiver_revoked(env: &Env, creator: &Address) {
     );
 }
 
+/// Issue #922: Emitted when a fee waiver's expiry is set or extended.
+/// Topics: (split, fw_exp, creator)
+/// Data: expires_at (0 = never)
+pub fn fee_waiver_expiry_set(env: &Env, creator: &Address, expires_at: u64) {
+    env.events().publish(
+        (
+            symbol_short!("split"),
+            symbol_short!("fw_exp"),
+            creator.clone(),
+        ),
+        expires_at,
+    );
+}
+
+/// Issue #922: Emitted when an expired fee waiver is purged from the whitelist.
+/// Topics: (split, fw_purge, creator)
+/// Data: expires_at
+pub fn fee_waiver_expired(env: &Env, creator: &Address, expires_at: u64) {
+    env.events().publish(
+        (
+            symbol_short!("split"),
+            symbol_short!("fw_purge"),
+            creator.clone(),
+        ),
+        expires_at,
+    );
+}
+
 /// Issue #285: Emitted when fee tiers are updated.
 /// Topics: (split, fee_tiers_updated)
 /// Data: count of tiers

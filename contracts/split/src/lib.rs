@@ -37,6 +37,8 @@ const STROOPS_PER_10K_INSTRUCTIONS: u64 = 1;
 
 /// Issue #296: Maximum entries in the per-creator fee waiver list.
 const MAX_FEE_WAIVER_ENTRIES: usize = 100;
+/// Issue #922: Maximum entries retained in the fee waiver audit log (oldest dropped first).
+const MAX_FEE_WAIVER_AUDIT_ENTRIES: u32 = 200;
 const DEFAULT_COMMITMENT_EXPIRY_LEDGERS: u32 = 100;
 
 /// Fixed-point scale for oracle-priced invoices: the oracle's `price()` return
@@ -90,7 +92,8 @@ use types::{
     AdminAction, AdminRole, AdminSet, AuditEntry, Bid, CircuitBreakerStatus,
     CloneOverrides, CompactInvoice, CompactMigrateResult, CompletionProof, ComputeEstimate,
     ConfidentialPayment, ContributionResult, CreateInvoiceParams, CreatorStats, DelayedPayout,
-    DisputeOutcome, DisputeRecord, DisputeStatus, FeeBracket, FeeSplit, FeeTier, InstalmentPlan,
+    DisputeOutcome, DisputeRecord, DisputeStatus, FeeBracket, FeeSplit, FeeTier, FeeWaiver,
+    FeeWaiverAction, FeeWaiverAuditEntry, InstalmentPlan,
     Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceExt3, InvoiceHot, InvoiceOptions,
     InvoiceOptions2, InvoicePayment, InvoiceStats, InvoiceStatus, InvoiceTemplate,
     InvoiceTemplateRecord, LegacyInvoice, OverflowBehavior, OverfundingPolicy, Payment,
@@ -179,6 +182,16 @@ fn fee_recipients_key() -> Symbol {
 /// Issue #296: Per-creator fee waiver list key (distinct from the recipient-level waiver list).
 fn creator_fee_waiver_key() -> Symbol {
     symbol_short!("cr_fw")
+}
+
+/// Issue #922: Per-creator fee waiver record (grantor, expiry, reason).
+fn fee_waiver_record_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("fw_rec"), creator.clone())
+}
+
+/// Issue #922: Bounded fee waiver audit log.
+fn fee_waiver_audit_key() -> Symbol {
+    symbol_short!("fw_audit")
 }
 
 /// Issue #297: Circuit breaker active flag key.
@@ -2303,6 +2316,142 @@ fn require_fn_not_paused(env: &Env, name: &Symbol) {
     if paused_fns.iter().any(|f| f == *name) {
         panic!("function paused");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #922: Fee waiver helpers
+// ---------------------------------------------------------------------------
+
+fn load_fee_waiver_list(env: &Env) -> Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&creator_fee_waiver_key())
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn fee_waiver_is_expired(env: &Env, waiver: &FeeWaiver) -> bool {
+    waiver.expires_at != 0 && env.ledger().timestamp() >= waiver.expires_at
+}
+
+/// True when `creator` is whitelisted and the waiver has not expired.
+/// Entries added before issue #922 carry no record and never expire.
+fn creator_has_active_fee_waiver(env: &Env, creator: &Address) -> bool {
+    if !load_fee_waiver_list(env).iter().any(|a| a == *creator) {
+        return false;
+    }
+    match env
+        .storage()
+        .persistent()
+        .get::<_, FeeWaiver>(&fee_waiver_record_key(creator))
+    {
+        Some(waiver) => !fee_waiver_is_expired(env, &waiver),
+        None => true,
+    }
+}
+
+fn record_fee_waiver_audit(
+    env: &Env,
+    action: FeeWaiverAction,
+    creator: &Address,
+    actor: &Address,
+    expires_at: u64,
+) {
+    let mut log: Vec<FeeWaiverAuditEntry> = env
+        .storage()
+        .persistent()
+        .get(&fee_waiver_audit_key())
+        .unwrap_or_else(|| Vec::new(env));
+    log.push_back(FeeWaiverAuditEntry {
+        action,
+        creator: creator.clone(),
+        actor: actor.clone(),
+        timestamp: env.ledger().timestamp(),
+        ledger: env.ledger().sequence(),
+        expires_at,
+    });
+    while log.len() > MAX_FEE_WAIVER_AUDIT_ENTRIES {
+        log.pop_front();
+    }
+    env.storage().persistent().set(&fee_waiver_audit_key(), &log);
+}
+
+/// Remove every expired waiver from the whitelist. Returns the number removed.
+fn purge_expired_fee_waivers_internal(env: &Env, actor: &Address) -> u32 {
+    let waivers = load_fee_waiver_list(env);
+    let mut kept: Vec<Address> = Vec::new(env);
+    let mut removed: u32 = 0;
+    for creator in waivers.iter() {
+        let record: Option<FeeWaiver> = env
+            .storage()
+            .persistent()
+            .get(&fee_waiver_record_key(&creator));
+        match record {
+            Some(waiver) if fee_waiver_is_expired(env, &waiver) => {
+                env.storage()
+                    .persistent()
+                    .remove(&fee_waiver_record_key(&creator));
+                record_fee_waiver_audit(
+                    env,
+                    FeeWaiverAction::Expired,
+                    &creator,
+                    actor,
+                    waiver.expires_at,
+                );
+                events::fee_waiver_expired(env, &creator, waiver.expires_at);
+                removed += 1;
+            }
+            _ => kept.push_back(creator),
+        }
+    }
+    if removed > 0 {
+        env.storage()
+            .persistent()
+            .set(&creator_fee_waiver_key(), &kept);
+    }
+    removed
+}
+
+/// Add or renew a waiver for `creator`. Shared by `add_fee_waiver` and `grant_fee_waiver`.
+fn grant_fee_waiver_internal(
+    env: &Env,
+    admin: &Address,
+    creator: &Address,
+    expires_at: u64,
+    reason: String,
+) {
+    assert!(
+        expires_at == 0 || expires_at > env.ledger().timestamp(),
+        "waiver expiry must be in the future"
+    );
+    // Free capacity held by lapsed waivers before enforcing the size cap.
+    purge_expired_fee_waivers_internal(env, admin);
+
+    let mut waivers = load_fee_waiver_list(env);
+    let already_listed = waivers.iter().any(|a| a == *creator);
+    if !already_listed {
+        assert!(
+            (waivers.len() as usize) < MAX_FEE_WAIVER_ENTRIES,
+            "fee waiver list full"
+        );
+        waivers.push_back(creator.clone());
+        env.storage()
+            .persistent()
+            .set(&creator_fee_waiver_key(), &waivers);
+    }
+
+    let waiver = FeeWaiver {
+        creator: creator.clone(),
+        granted_by: admin.clone(),
+        granted_at: env.ledger().timestamp(),
+        expires_at,
+        reason,
+    };
+    env.storage()
+        .persistent()
+        .set(&fee_waiver_record_key(creator), &waiver);
+    record_fee_waiver_audit(env, FeeWaiverAction::Granted, creator, admin, expires_at);
+    events::fee_waiver_granted(env, creator);
+    events::fee_waiver_expiry_set(env, creator, expires_at);
 }
 
 // ---------------------------------------------------------------------------
@@ -9543,14 +9692,8 @@ impl SplitContract {
 
         let funding_token_client = token::Client::new(env, &funding_token_for(invoice));
 
-        let creator_waived: bool = {
-            let cfw: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&creator_fee_waiver_key())
-                .unwrap_or_else(|| Vec::new(env));
-            cfw.iter().any(|a| a == invoice.creator)
-        };
+        // Issue #922: expired waivers no longer exempt the creator.
+        let creator_waived: bool = creator_has_active_fee_waiver(env, &invoice.creator);
 
         let total: i128 = invoice.amounts.iter().sum();
         let funded = invoice.funded;
@@ -10096,14 +10239,8 @@ impl SplitContract {
         let funding_token_client = token::Client::new(env, &funding_token_for(invoice));
 
         // Issue #296: if creator has a fee waiver, platform_fee_bps is 0 for this invoice.
-        let creator_waived: bool = {
-            let cfw: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&creator_fee_waiver_key())
-                .unwrap_or_else(|| Vec::new(env));
-            cfw.iter().any(|a| a == invoice.creator)
-        };
+        // Issue #922: expired waivers no longer exempt the creator.
+        let creator_waived: bool = creator_has_active_fee_waiver(env, &invoice.creator);
 
         let funded = invoice.funded;
 
@@ -13758,38 +13895,66 @@ impl SplitContract {
     }
 
     // -----------------------------------------------------------------------
-    // Issue #296: Per-creator fee waiver list
+    // Issue #296 / #922: Per-creator fee waiver whitelist
     // -----------------------------------------------------------------------
 
-    /// Grant a fee waiver to a creator. Admin-only. Max 100 entries.
+    /// Grant a non-expiring fee waiver to a creator. Admin-only. Max 100 entries.
+    /// Idempotent: re-adding a creator who already holds an active waiver is a no-op.
     pub fn add_fee_waiver(env: Env, admin: Address, creator: Address) {
         require_admin_role(&env, &admin, AdminRole::SuperAdmin);
-        let mut waivers: Vec<Address> = env
+        if creator_has_active_fee_waiver(&env, &creator) {
+            return;
+        }
+        grant_fee_waiver_internal(&env, &admin, &creator, 0, String::from_str(&env, ""));
+    }
+
+    /// Issue #922: Grant (or renew) a fee waiver with an expiry and reason. Admin-only.
+    /// `expires_at` is a ledger timestamp; pass `0` for a waiver that never expires.
+    pub fn grant_fee_waiver(
+        env: Env,
+        admin: Address,
+        creator: Address,
+        expires_at: u64,
+        reason: String,
+    ) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        grant_fee_waiver_internal(&env, &admin, &creator, expires_at, reason);
+    }
+
+    /// Issue #922: Change the expiry of an existing, still-active waiver. Admin-only.
+    pub fn extend_fee_waiver(env: Env, admin: Address, creator: Address, expires_at: u64) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        assert!(
+            creator_has_active_fee_waiver(&env, &creator),
+            "no active fee waiver"
+        );
+        assert!(
+            expires_at == 0 || expires_at > env.ledger().timestamp(),
+            "waiver expiry must be in the future"
+        );
+        let mut waiver: FeeWaiver = env
             .storage()
             .persistent()
-            .get(&creator_fee_waiver_key())
-            .unwrap_or_else(|| Vec::new(&env));
-        assert!(
-            (waivers.len() as usize) < MAX_FEE_WAIVER_ENTRIES,
-            "fee waiver list full"
-        );
-        if !waivers.iter().any(|a| a == creator) {
-            waivers.push_back(creator.clone());
-            env.storage()
-                .persistent()
-                .set(&creator_fee_waiver_key(), &waivers);
-            events::fee_waiver_granted(&env, &creator);
-        }
+            .get(&fee_waiver_record_key(&creator))
+            .unwrap_or(FeeWaiver {
+                creator: creator.clone(),
+                granted_by: admin.clone(),
+                granted_at: env.ledger().timestamp(),
+                expires_at: 0,
+                reason: String::from_str(&env, ""),
+            });
+        waiver.expires_at = expires_at;
+        env.storage()
+            .persistent()
+            .set(&fee_waiver_record_key(&creator), &waiver);
+        record_fee_waiver_audit(&env, FeeWaiverAction::Extended, &creator, &admin, expires_at);
+        events::fee_waiver_expiry_set(&env, &creator, expires_at);
     }
 
     /// Revoke a fee waiver from a creator. Admin-only.
     pub fn remove_fee_waiver(env: Env, admin: Address, creator: Address) {
         require_admin_role(&env, &admin, AdminRole::SuperAdmin);
-        let waivers: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&creator_fee_waiver_key())
-            .unwrap_or_else(|| Vec::new(&env));
+        let waivers = load_fee_waiver_list(&env);
         let mut new_waivers: Vec<Address> = Vec::new(&env);
         for a in waivers.iter() {
             if a != creator {
@@ -13799,17 +13964,59 @@ impl SplitContract {
         env.storage()
             .persistent()
             .set(&creator_fee_waiver_key(), &new_waivers);
+        let expires_at = env
+            .storage()
+            .persistent()
+            .get::<_, FeeWaiver>(&fee_waiver_record_key(&creator))
+            .map(|w| w.expires_at)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .remove(&fee_waiver_record_key(&creator));
+        record_fee_waiver_audit(&env, FeeWaiverAction::Revoked, &creator, &admin, expires_at);
         events::fee_waiver_revoked(&env, &creator);
     }
 
-    /// Returns true if the creator is on the fee waiver list.
+    /// Issue #922: Remove all expired waivers from the whitelist. Callable by anyone.
+    /// Returns the number of waivers removed.
+    pub fn purge_expired_fee_waivers(env: Env, caller: Address) -> u32 {
+        caller.require_auth();
+        purge_expired_fee_waivers_internal(&env, &caller)
+    }
+
+    /// Returns true if the creator holds an active (unexpired) fee waiver.
     pub fn has_fee_waiver(env: Env, creator: Address) -> bool {
-        let waivers: Vec<Address> = env
-            .storage()
+        creator_has_active_fee_waiver(&env, &creator)
+    }
+
+    /// Issue #922: Returns the waiver record for a whitelisted creator, if any.
+    /// Expired waivers that have not yet been purged are still returned.
+    pub fn get_fee_waiver(env: Env, creator: Address) -> Option<FeeWaiver> {
+        if !load_fee_waiver_list(&env).iter().any(|a| a == creator) {
+            return None;
+        }
+        env.storage()
             .persistent()
-            .get(&creator_fee_waiver_key())
-            .unwrap_or_else(|| Vec::new(&env));
-        waivers.iter().any(|a| a == creator)
+            .get(&fee_waiver_record_key(&creator))
+    }
+
+    /// Issue #922: Returns all creators currently holding an active fee waiver.
+    pub fn list_fee_waivers(env: Env) -> Vec<Address> {
+        let mut active: Vec<Address> = Vec::new(&env);
+        for creator in load_fee_waiver_list(&env).iter() {
+            if creator_has_active_fee_waiver(&env, &creator) {
+                active.push_back(creator);
+            }
+        }
+        active
+    }
+
+    /// Issue #922: Returns the fee waiver audit log (most recent last, capped at 200).
+    pub fn get_fee_waiver_audit_log(env: Env) -> Vec<FeeWaiverAuditEntry> {
+        env.storage()
+            .persistent()
+            .get(&fee_waiver_audit_key())
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // -----------------------------------------------------------------------

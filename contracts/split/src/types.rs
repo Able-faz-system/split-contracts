@@ -1661,6 +1661,40 @@ pub struct CircuitBreakerStatus {
     pub reason: Option<String>,
 }
 
+/// Issue #922: Fee waiver record for a whitelisted creator.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeeWaiver {
+    pub creator: Address,
+    pub granted_by: Address,
+    pub granted_at: u64,
+    /// Ledger timestamp at which the waiver lapses; `0` means it never expires.
+    pub expires_at: u64,
+    pub reason: String,
+}
+
+/// Issue #922: Action recorded in the fee waiver audit log.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum FeeWaiverAction {
+    Granted,
+    Extended,
+    Revoked,
+    Expired,
+}
+
+/// Issue #922: A single fee waiver audit log entry.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeeWaiverAuditEntry {
+    pub action: FeeWaiverAction,
+    pub creator: Address,
+    pub actor: Address,
+    pub timestamp: u64,
+    pub ledger: u32,
+    pub expires_at: u64,
+}
+
 /// Issue #295: A single confidential payment record stored per payer.
 #[contracttype]
 #[derive(Clone, Debug)]
