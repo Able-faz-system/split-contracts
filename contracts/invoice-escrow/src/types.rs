@@ -1,6 +1,6 @@
 //! Type definitions for the invoice-escrow contract.
 
-use soroban_sdk::{contracttype, Address, BytesN};
+use soroban_sdk::{contracttype, Address, BytesN, Vec};
 
 /// Lifecycle state of an escrow invoice.
 #[contracttype]
@@ -124,4 +124,44 @@ pub struct BlacklistEntry {
     pub upheld: bool,
     /// Hash of the reason for blacklisting (provided by admin).
     pub reason_hash: BytesN<32>,
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Co-signer approval types
+// ──────────────────────────────────────────────────────────────────────
+
+/// Aggregate state of an invoice's N-of-M co-signer approval.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ApprovalStatus {
+    /// Fewer than `threshold` approvals, and the threshold is still reachable.
+    Pending,
+    /// At least `threshold` co-signers have approved; release is unblocked.
+    Approved,
+    /// Enough co-signers rejected that `threshold` can no longer be reached.
+    Rejected,
+}
+
+/// N-of-M co-signer approval record attached to an escrow invoice.
+///
+/// While an approval record exists, the invoice can only be released once
+/// `status` is [`ApprovalStatus::Approved`]. Each co-signer authenticates
+/// with `require_auth`, may vote once (approve or reject), and may revoke
+/// that vote until the invoice is released. `status` is recomputed after
+/// every vote so it always reflects the current tallies.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CosignerApproval {
+    /// Addresses allowed to vote on the release.
+    pub signers: Vec<Address>,
+    /// Number of approvals required to release.
+    pub threshold: u32,
+    /// Co-signers that have approved.
+    pub approvals: Vec<Address>,
+    /// Co-signers that have rejected.
+    pub rejections: Vec<Address>,
+    /// Current aggregate status derived from the tallies.
+    pub status: ApprovalStatus,
+    /// Ledger sequence of the most recent change to this record.
+    pub updated_ledger: u32,
 }

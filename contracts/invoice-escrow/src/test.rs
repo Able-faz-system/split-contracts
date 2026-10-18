@@ -843,3 +843,330 @@ fn test_release_emits_escrow_released_event() {
     }
     assert!(found, "EscrowReleased event was not emitted during release");
 }
+
+// ---------------------------------------------------------------------------
+// Co-signer approval (#914)
+// ---------------------------------------------------------------------------
+
+mod cosigner_tests {
+    use super::*;
+    use crate::types::ApprovalStatus;
+    use soroban_sdk::{vec, Symbol, TryFromVal, Vec};
+
+    struct Ctx {
+        env: Env,
+        contract_id: Address,
+        creator: Address,
+        payer: Address,
+        token: Address,
+        id: u64,
+    }
+
+    impl Ctx {
+        fn client(&self) -> InvoiceEscrowContractClient<'_> {
+            InvoiceEscrowContractClient::new(&self.env, &self.contract_id)
+        }
+    }
+
+    fn setup_invoice(total: i128) -> Ctx {
+        let (env, contract_id) = setup();
+        let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = create_token(&env, &token_admin);
+        mint(&env, &token, &token_admin, &payer, total * 2);
+
+        client.initialize(&admin);
+        let deadline = env.ledger().timestamp() + 10_000;
+        let id = client.create_invoice(&creator, &token, &total, &deadline);
+        Ctx { env, contract_id, creator, payer, token, id }
+    }
+
+    fn signers(env: &Env, n: u32) -> Vec<Address> {
+        let mut v = Vec::new(env);
+        for _ in 0..n {
+            v.push_back(Address::generate(env));
+        }
+        v
+    }
+
+    #[test]
+    fn test_set_cosigners_creates_pending_approval() {
+        let ctx = setup_invoice(1_000);
+        let client = ctx.client();
+        let s = signers(&ctx.env, 3);
+
+        client.set_cosigners(&ctx.id, &s, &2);
+
+        let approval = client.get_approval(&ctx.id).unwrap();
+        assert_eq!(approval.signers, s);
+        assert_eq!(approval.threshold, 2);
+        assert_eq!(approval.approvals.len(), 0);
+        assert_eq!(approval.status, ApprovalStatus::Pending);
+        assert_eq!(client.approvals_remaining(&ctx.id), 2);
+    }
+
+    #[test]
+    fn test_set_cosigners_invalid_configs() {
+        let ctx = setup_invoice(1_000);
+        let client = ctx.client();
+        let s = signers(&ctx.env, 2);
+
+        assert_eq!(
+            client.try_set_cosigners(&ctx.id, &Vec::new(&ctx.env), &1),
+            Err(Ok(Error::InvalidCosignerConfig))
+        );
+        assert_eq!(
+            client.try_set_cosigners(&ctx.id, &s, &0),
+            Err(Ok(Error::InvalidCosignerConfig))
+        );
+        assert_eq!(
+            client.try_set_cosigners(&ctx.id, &s, &3),
+            Err(Ok(Error::InvalidCosignerConfig))
+        );
+        let a = s.get(0).unwrap();
+        let dup = vec![&ctx.env, a.clone(), a];
+        assert_eq!(
+            client.try_set_cosigners(&ctx.id, &dup, &1),
+            Err(Ok(Error::InvalidCosignerConfig))
+        );
+        assert_eq!(
+            client.try_set_cosigners(&ctx.id, &signers(&ctx.env, 21), &1),
+            Err(Ok(Error::InvalidCosignerConfig))
+        );
+    }
+
+    #[test]
+    fn test_set_cosigners_unknown_invoice() {
+        let ctx = setup_invoice(1_000);
+        let s = signers(&ctx.env, 1);
+        assert_eq!(
+            ctx.client().try_set_cosigners(&99, &s, &1),
+            Err(Ok(Error::InvoiceNotFound))
+        );
+    }
+
+    #[test]
+    fn test_set_cosigners_locked_after_vote() {
+        let ctx = setup_invoice(1_000);
+        let client = ctx.client();
+        let s = signers(&ctx.env, 2);
+        client.set_cosigners(&ctx.id, &s, &2);
+
+        // Replacing before any vote is allowed.
+        client.set_cosigners(&ctx.id, &s, &1);
+
+        client.approve_release(&s.get(0).unwrap(), &ctx.id);
+        assert_eq!(
+            client.try_set_cosigners(&ctx.id, &s, &2),
+            Err(Ok(Error::CosignersLocked))
+        );
+    }
+
+    #[test]
+    fn test_full_funding_does_not_auto_release_without_approval() {
+        let ctx = setup_invoice(1_000);
+        let client = ctx.client();
+        let s = signers(&ctx.env, 2);
+        client.set_cosigners(&ctx.id, &s, &2);
+
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+        let invoice = client.get_invoice(&ctx.id);
+        assert_eq!(invoice.status, EscrowStatus::Active);
+        assert_eq!(invoice.funded_amount, 1_000);
+
+        assert_eq!(client.try_release(&ctx.id), Err(Ok(Error::ApprovalRequired)));
+    }
+
+    #[test]
+    fn test_threshold_approval_unblocks_release() {
+        let ctx = setup_invoice(1_000);
+        let client = ctx.client();
+        let s = signers(&ctx.env, 3);
+        client.set_cosigners(&ctx.id, &s, &2);
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+
+        assert_eq!(client.approve_release(&s.get(0).unwrap(), &ctx.id), ApprovalStatus::Pending);
+        assert_eq!(client.approvals_remaining(&ctx.id), 1);
+        assert!(client.has_approved(&ctx.id, &s.get(0).unwrap()));
+        assert!(!client.has_approved(&ctx.id, &s.get(1).unwrap()));
+
+        assert_eq!(client.approve_release(&s.get(1).unwrap(), &ctx.id), ApprovalStatus::Approved);
+        assert_eq!(client.get_approval_status(&ctx.id), Some(ApprovalStatus::Approved));
+        assert_eq!(client.approvals_remaining(&ctx.id), 0);
+
+        client.release(&ctx.id);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Released);
+        let tok = token::Client::new(&ctx.env, &ctx.token);
+        assert_eq!(tok.balance(&ctx.creator), 1_000);
+    }
+
+    #[test]
+    fn test_approval_before_full_funding_allows_auto_release() {
+        let ctx = setup_invoice(1_000);
+        let client = ctx.client();
+        let s = signers(&ctx.env, 1);
+        client.set_cosigners(&ctx.id, &s, &1);
+        client.approve_release(&s.get(0).unwrap(), &ctx.id);
+
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Released);
+    }
+
+    #[test]
+    fn test_non_cosigner_cannot_vote() {
+        let ctx = setup_invoice(1_000);
+        let client = ctx.client();
+        client.set_cosigners(&ctx.id, &signers(&ctx.env, 2), &1);
+        let outsider = Address::generate(&ctx.env);
+
+        assert_eq!(
+            client.try_approve_release(&outsider, &ctx.id),
+            Err(Ok(Error::NotCosigner))
+        );
+        assert_eq!(
+            client.try_reject_release(&outsider, &ctx.id),
+            Err(Ok(Error::NotCosigner))
+        );
+    }
+
+    #[test]
+    fn test_vote_without_cosigners_fails() {
+        let ctx = setup_invoice(1_000);
+        let signer = Address::generate(&ctx.env);
+        assert_eq!(
+            ctx.client().try_approve_release(&signer, &ctx.id),
+            Err(Ok(Error::NoCosigners))
+        );
+    }
+
+    #[test]
+    fn test_duplicate_votes_rejected() {
+        let ctx = setup_invoice(1_000);
+        let client = ctx.client();
+        let s = signers(&ctx.env, 3);
+        client.set_cosigners(&ctx.id, &s, &2);
+        let a = s.get(0).unwrap();
+
+        client.approve_release(&a, &ctx.id);
+        assert_eq!(client.try_approve_release(&a, &ctx.id), Err(Ok(Error::AlreadyVoted)));
+        assert_eq!(client.try_reject_release(&a, &ctx.id), Err(Ok(Error::AlreadyVoted)));
+
+        // Tally unaffected by the rejected duplicates.
+        let approval = client.get_approval(&ctx.id).unwrap();
+        assert_eq!(approval.approvals.len(), 1);
+        assert_eq!(approval.rejections.len(), 0);
+    }
+
+    #[test]
+    fn test_interleaved_votes_tally_correctly() {
+        let ctx = setup_invoice(1_000);
+        let client = ctx.client();
+        let s = signers(&ctx.env, 5);
+        client.set_cosigners(&ctx.id, &s, &3);
+
+        client.approve_release(&s.get(0).unwrap(), &ctx.id);
+        client.reject_release(&s.get(1).unwrap(), &ctx.id);
+        client.approve_release(&s.get(2).unwrap(), &ctx.id);
+        client.reject_release(&s.get(3).unwrap(), &ctx.id);
+        assert_eq!(client.get_approval_status(&ctx.id), Some(ApprovalStatus::Pending));
+
+        assert_eq!(client.approve_release(&s.get(4).unwrap(), &ctx.id), ApprovalStatus::Approved);
+        let approval = client.get_approval(&ctx.id).unwrap();
+        assert_eq!(approval.approvals.len(), 3);
+        assert_eq!(approval.rejections.len(), 2);
+    }
+
+    #[test]
+    fn test_rejection_blocks_release_when_threshold_unreachable() {
+        let ctx = setup_invoice(1_000);
+        let client = ctx.client();
+        let s = signers(&ctx.env, 3);
+        client.set_cosigners(&ctx.id, &s, &2);
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+
+        assert_eq!(client.reject_release(&s.get(0).unwrap(), &ctx.id), ApprovalStatus::Pending);
+        assert_eq!(client.reject_release(&s.get(1).unwrap(), &ctx.id), ApprovalStatus::Rejected);
+        assert_eq!(client.try_release(&ctx.id), Err(Ok(Error::ApprovalRejected)));
+    }
+
+    #[test]
+    fn test_revoke_transitions_status_back() {
+        let ctx = setup_invoice(1_000);
+        let client = ctx.client();
+        let s = signers(&ctx.env, 2);
+        client.set_cosigners(&ctx.id, &s, &1);
+        let a = s.get(0).unwrap();
+        let b = s.get(1).unwrap();
+
+        assert_eq!(client.approve_release(&a, &ctx.id), ApprovalStatus::Approved);
+        assert_eq!(client.revoke_vote(&a, &ctx.id), ApprovalStatus::Pending);
+        assert!(!client.has_approved(&ctx.id, &a));
+
+        client.reject_release(&a, &ctx.id);
+        assert_eq!(client.reject_release(&b, &ctx.id), ApprovalStatus::Rejected);
+        assert_eq!(client.revoke_vote(&b, &ctx.id), ApprovalStatus::Pending);
+
+        assert_eq!(client.try_revoke_vote(&b, &ctx.id), Err(Ok(Error::NotVoted)));
+    }
+
+    #[test]
+    fn test_votes_blocked_after_release() {
+        let ctx = setup_invoice(1_000);
+        let client = ctx.client();
+        let s = signers(&ctx.env, 2);
+        client.set_cosigners(&ctx.id, &s, &1);
+        client.approve_release(&s.get(0).unwrap(), &ctx.id);
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Released);
+
+        assert_eq!(
+            client.try_approve_release(&s.get(1).unwrap(), &ctx.id),
+            Err(Ok(Error::InvalidStatus))
+        );
+        assert_eq!(
+            client.try_revoke_vote(&s.get(0).unwrap(), &ctx.id),
+            Err(Ok(Error::InvalidStatus))
+        );
+        assert_eq!(
+            client.try_set_cosigners(&ctx.id, &s, &1),
+            Err(Ok(Error::InvalidStatus))
+        );
+    }
+
+    #[test]
+    fn test_invoice_without_cosigners_unaffected() {
+        let ctx = setup_invoice(1_000);
+        let client = ctx.client();
+        assert_eq!(client.get_approval_status(&ctx.id), None);
+        assert_eq!(client.approvals_remaining(&ctx.id), 0);
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Released);
+    }
+
+    #[test]
+    fn test_approve_emits_events() {
+        let ctx = setup_invoice(1_000);
+        let client = ctx.client();
+        let s = signers(&ctx.env, 1);
+        client.set_cosigners(&ctx.id, &s, &1);
+        client.approve_release(&s.get(0).unwrap(), &ctx.id);
+
+        let events = ctx.env.events().all();
+        let has_topic = |name: Symbol| {
+            events.events().iter().any(|e| {
+                xdr_event_topics(&ctx.env, e)
+                    .map(|t| {
+                        t.len() >= 2
+                            && Symbol::try_from_val(&ctx.env, &t.get(1).unwrap())
+                                .map_or(false, |sym| sym == name)
+                    })
+                    .unwrap_or(false)
+            })
+        };
+        assert!(has_topic(symbol_short!("approved")));
+        assert!(has_topic(symbol_short!("appr_stat")));
+    }
+}

@@ -5,6 +5,7 @@
 //! - Automatic fund release when fully funded
 //! - Deadline-based refund fallback
 //! - **Upgradable admin authority** via a two-step `transfer_admin` flow
+//! - **Co-signer approval**: optional N-of-M sign-off gating release
 //!
 //! # Admin Transfer Flow
 //!
@@ -27,7 +28,9 @@ use errors::Error;
 use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, BytesN, Env, Symbol, Vec,
 };
-use types::{BlacklistEntry, EscrowInvoice, EscrowReleased, EscrowStatus};
+use types::{
+    ApprovalStatus, BlacklistEntry, CosignerApproval, EscrowInvoice, EscrowReleased, EscrowStatus,
+};
 
 // ---------------------------------------------------------------------------
 // Storage key helpers
@@ -63,6 +66,11 @@ fn blacklist_key(payer: &Address) -> (Symbol, Address) {
     (symbol_short!("blacklist"), payer.clone())
 }
 
+/// Persistent storage: co-signer approval record for an invoice.
+fn approval_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("approval"), id)
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -70,6 +78,10 @@ fn blacklist_key(payer: &Address) -> (Symbol, Address) {
 /// Number of ledgers during which a blacklisted payer can submit an appeal.
 /// ~30 minutes at 5s ledger close time.
 const APPEAL_WINDOW_LEDGERS: u32 = 360;
+
+/// Maximum number of co-signers on a single invoice. Bounds the linear
+/// membership scans performed on every vote.
+const MAX_COSIGNERS: u32 = 20;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -94,6 +106,92 @@ fn get_invoice(env: &Env, id: u64) -> Result<EscrowInvoice, Error> {
 
 fn save_invoice(env: &Env, id: u64, invoice: &EscrowInvoice) {
     env.storage().persistent().set(&invoice_key(id), invoice);
+}
+
+/// Returns `true` while the invoice can still accept configuration changes
+/// and votes (i.e. it has not been released, refunded or cancelled).
+fn is_open(invoice: &EscrowInvoice) -> bool {
+    invoice.status == EscrowStatus::Pending || invoice.status == EscrowStatus::Active
+}
+
+fn get_approval(env: &Env, id: u64) -> Option<CosignerApproval> {
+    env.storage().persistent().get(&approval_key(id))
+}
+
+fn save_approval(env: &Env, id: u64, approval: &CosignerApproval) {
+    env.storage().persistent().set(&approval_key(id), approval);
+}
+
+/// Recompute `approval.status` from the current tallies.
+fn recompute_approval_status(approval: &mut CosignerApproval) {
+    let remaining = approval.signers.len() - approval.rejections.len();
+    approval.status = if approval.approvals.len() >= approval.threshold {
+        ApprovalStatus::Approved
+    } else if remaining < approval.threshold {
+        ApprovalStatus::Rejected
+    } else {
+        ApprovalStatus::Pending
+    };
+}
+
+/// Check every release gate configured on the invoice. Returns `Ok(())`
+/// when the invoice may be released now.
+fn check_release_gates(env: &Env, id: u64) -> Result<(), Error> {
+    if let Some(approval) = get_approval(env, id) {
+        match approval.status {
+            ApprovalStatus::Approved => {}
+            ApprovalStatus::Pending => return Err(Error::ApprovalRequired),
+            ApprovalStatus::Rejected => return Err(Error::ApprovalRejected),
+        }
+    }
+    Ok(())
+}
+
+/// Shared implementation of `approve_release` / `reject_release`.
+fn cast_vote(env: &Env, signer: Address, invoice_id: u64, approve: bool) -> Result<ApprovalStatus, Error> {
+    signer.require_auth();
+    let invoice = get_invoice(env, invoice_id)?;
+    if !is_open(&invoice) {
+        return Err(Error::InvalidStatus);
+    }
+    let mut approval = get_approval(env, invoice_id).ok_or(Error::NoCosigners)?;
+    if !approval.signers.contains(&signer) {
+        return Err(Error::NotCosigner);
+    }
+    if approval.approvals.contains(&signer) || approval.rejections.contains(&signer) {
+        return Err(Error::AlreadyVoted);
+    }
+
+    let action = if approve {
+        approval.approvals.push_back(signer.clone());
+        symbol_short!("approved")
+    } else {
+        approval.rejections.push_back(signer.clone());
+        symbol_short!("rejected")
+    };
+
+    let old_status = approval.status.clone();
+    recompute_approval_status(&mut approval);
+    approval.updated_ledger = env.ledger().sequence();
+    save_approval(env, invoice_id, &approval);
+
+    emit_cosigner_vote(env, action, invoice_id, &signer, &approval);
+    if old_status != approval.status {
+        emit_approval_status_changed(env, invoice_id, &old_status, &approval.status);
+    }
+    Ok(approval.status)
+}
+
+/// Mark the invoice released and transfer `total_amount` to the creator.
+fn execute_release(env: &Env, id: u64, invoice: &mut EscrowInvoice) -> (Address, i128) {
+    let total = invoice.total_amount;
+    let creator = invoice.creator.clone();
+    invoice.status = EscrowStatus::Released;
+    save_invoice(env, id, invoice);
+    let token_client = token::Client::new(env, &invoice.token);
+    token_client.transfer(&env.current_contract_address(), &creator, &total);
+    emit_released(env, id, total);
+    (creator, total)
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +251,37 @@ fn emit_refunded(env: &Env, id: u64, payer: &Address, amount: i128) {
     env.events().publish(
         (symbol_short!("escrow"), symbol_short!("refunded"), id),
         (payer.clone(), amount),
+    );
+}
+
+/// Topics: `(escrow, cosig_set, id)` — Data: `(signers, threshold)`
+fn emit_cosigners_set(env: &Env, id: u64, signers: &Vec<Address>, threshold: u32) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("cosig_set"), id),
+        (signers.clone(), threshold),
+    );
+}
+
+/// Topics: `(escrow, <action>, id)` — Data: `(signer, approvals, rejections, status)`
+///
+/// `action` is one of `approved`, `rejected` or `revoked`.
+fn emit_cosigner_vote(env: &Env, action: Symbol, id: u64, signer: &Address, approval: &CosignerApproval) {
+    env.events().publish(
+        (symbol_short!("escrow"), action, id),
+        (
+            signer.clone(),
+            approval.approvals.len(),
+            approval.rejections.len(),
+            approval.status.clone(),
+        ),
+    );
+}
+
+/// Topics: `(escrow, appr_stat, id)` — Data: `(old_status, new_status)`
+fn emit_approval_status_changed(env: &Env, id: u64, old: &ApprovalStatus, new: &ApprovalStatus) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("appr_stat"), id),
+        (old.clone(), new.clone()),
     );
 }
 
@@ -431,14 +560,11 @@ impl InvoiceEscrowContract {
 
         emit_deposited(&env, invoice_id, &payer, amount, new_funded);
 
-        // Auto-release on full funding.
-        if new_funded >= invoice.total_amount {
-            let total = invoice.total_amount;
-            let creator = invoice.creator.clone();
-            invoice.status = EscrowStatus::Released;
-            save_invoice(&env, invoice_id, &invoice);
-            token_client.transfer(&env.current_contract_address(), &creator, &total);
-            emit_released(&env, invoice_id, total);
+        // Auto-release on full funding, unless a release gate (e.g. pending
+        // co-signer approval) still blocks it. A gated invoice stays `Active`
+        // and fully funded until `release` is called once the gate clears.
+        if new_funded >= invoice.total_amount && check_release_gates(&env, invoice_id).is_ok() {
+            execute_release(&env, invoice_id, &mut invoice);
         } else {
             save_invoice(&env, invoice_id, &invoice);
         }
@@ -449,12 +575,15 @@ impl InvoiceEscrowContract {
     /// Release funds to the creator once the invoice is fully funded.
     ///
     /// Anyone may call this after the invoice reaches `total_amount`. Useful
-    /// if auto-release did not fire (e.g. due to separate partial deposits).
+    /// if auto-release did not fire (e.g. due to separate partial deposits,
+    /// or because a release gate was still closed when funding completed).
     ///
     /// # Errors
     /// * [`Error::InvoiceNotFound`]    — Unknown invoice ID.
     /// * [`Error::InvalidStatus`]      — Invoice was already released/refunded/cancelled.
     /// * [`Error::InsufficientFunding`] — Not fully funded yet.
+    /// * [`Error::ApprovalRequired`]   — Co-signer threshold not yet reached.
+    /// * [`Error::ApprovalRejected`]   — Co-signers rejected the release.
     pub fn release(env: Env, invoice_id: u64) -> Result<(), Error> {
         let mut invoice = get_invoice(&env, invoice_id)?;
 
@@ -467,15 +596,9 @@ impl InvoiceEscrowContract {
         if invoice.funded_amount < invoice.total_amount {
             return Err(Error::InsufficientFunding);
         }
+        check_release_gates(&env, invoice_id)?;
 
-        let total = invoice.total_amount;
-        let creator = invoice.creator.clone();
-        invoice.status = EscrowStatus::Released;
-        save_invoice(&env, invoice_id, &invoice);
-
-        let token_client = token::Client::new(&env, &invoice.token);
-        token_client.transfer(&env.current_contract_address(), &creator, &total);
-        emit_released(&env, invoice_id, total);
+        let (creator, total) = execute_release(&env, invoice_id, &mut invoice);
 
         // Emit structured EscrowReleased event for off-chain indexers.
         env.events().publish(
@@ -564,6 +687,148 @@ impl InvoiceEscrowContract {
         invoice.status = EscrowStatus::Cancelled;
         save_invoice(&env, invoice_id, &invoice);
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Co-signer approval
+    // -----------------------------------------------------------------------
+
+    /// Require N-of-M co-signer approval before the invoice can be released.
+    ///
+    /// Only the invoice creator may configure co-signers, and only while the
+    /// invoice is open and no co-signer has voted yet. Calling again before
+    /// any vote replaces the previous configuration.
+    ///
+    /// # Arguments
+    /// * `invoice_id` — Target invoice.
+    /// * `signers`    — Distinct co-signer addresses (1..=`MAX_COSIGNERS`).
+    /// * `threshold`  — Approvals required, in `1..=signers.len()`.
+    ///
+    /// # Events
+    /// Emits `(escrow, cosig_set, id)` with `(signers, threshold)`.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`]       — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]         — Invoice is no longer open.
+    /// * [`Error::InvalidCosignerConfig`] — Bad signer list or threshold.
+    /// * [`Error::CosignersLocked`]       — A co-signer has already voted.
+    pub fn set_cosigners(
+        env: Env,
+        invoice_id: u64,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        invoice.creator.require_auth();
+        if !is_open(&invoice) {
+            return Err(Error::InvalidStatus);
+        }
+
+        let count = signers.len();
+        if count == 0 || count > MAX_COSIGNERS || threshold == 0 || threshold > count {
+            return Err(Error::InvalidCosignerConfig);
+        }
+        for i in 0..count {
+            let signer = signers.get_unchecked(i);
+            for j in (i + 1)..count {
+                if signers.get_unchecked(j) == signer {
+                    return Err(Error::InvalidCosignerConfig);
+                }
+            }
+        }
+
+        if let Some(existing) = get_approval(&env, invoice_id) {
+            if !existing.approvals.is_empty() || !existing.rejections.is_empty() {
+                return Err(Error::CosignersLocked);
+            }
+        }
+
+        let approval = CosignerApproval {
+            signers: signers.clone(),
+            threshold,
+            approvals: Vec::new(&env),
+            rejections: Vec::new(&env),
+            status: ApprovalStatus::Pending,
+            updated_ledger: env.ledger().sequence(),
+        };
+        save_approval(&env, invoice_id, &approval);
+        emit_cosigners_set(&env, invoice_id, &signers, threshold);
+        Ok(())
+    }
+
+    /// Approve the release of an invoice as one of its co-signers.
+    ///
+    /// The signer authenticates via `require_auth` and must be in the
+    /// configured signer list. Each co-signer may vote once; duplicate votes
+    /// are rejected, so concurrent or replayed approvals cannot inflate the
+    /// tally. When the threshold is reached the status becomes `Approved`.
+    ///
+    /// Approving does not release funds by itself — call [`Self::release`]
+    /// once the invoice is fully funded and approved.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`] — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]   — Invoice is no longer open.
+    /// * [`Error::NoCosigners`]     — No co-signers configured.
+    /// * [`Error::NotCosigner`]     — `signer` is not a configured co-signer.
+    /// * [`Error::AlreadyVoted`]    — `signer` already approved or rejected.
+    pub fn approve_release(env: Env, signer: Address, invoice_id: u64) -> Result<ApprovalStatus, Error> {
+        cast_vote(&env, signer, invoice_id, true)
+    }
+
+    /// Reject the release of an invoice as one of its co-signers.
+    ///
+    /// Once enough co-signers reject that the threshold can no longer be
+    /// reached, the status becomes `Rejected` and release is blocked.
+    ///
+    /// # Errors
+    /// Same as [`Self::approve_release`].
+    pub fn reject_release(env: Env, signer: Address, invoice_id: u64) -> Result<ApprovalStatus, Error> {
+        cast_vote(&env, signer, invoice_id, false)
+    }
+
+    /// Withdraw a previously cast approval or rejection.
+    ///
+    /// Allowed only while the invoice is open (not yet released). The status
+    /// is recomputed, so revoking an approval can move `Approved` back to
+    /// `Pending`, and revoking a rejection can move `Rejected` back to
+    /// `Pending`.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`] — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]   — Invoice is no longer open.
+    /// * [`Error::NoCosigners`]     — No co-signers configured.
+    /// * [`Error::NotCosigner`]     — `signer` is not a configured co-signer.
+    /// * [`Error::NotVoted`]        — `signer` has no vote to revoke.
+    pub fn revoke_vote(env: Env, signer: Address, invoice_id: u64) -> Result<ApprovalStatus, Error> {
+        signer.require_auth();
+        let invoice = get_invoice(&env, invoice_id)?;
+        if !is_open(&invoice) {
+            return Err(Error::InvalidStatus);
+        }
+        let mut approval = get_approval(&env, invoice_id).ok_or(Error::NoCosigners)?;
+        if !approval.signers.contains(&signer) {
+            return Err(Error::NotCosigner);
+        }
+
+        if let Some(idx) = approval.approvals.first_index_of(&signer) {
+            approval.approvals.remove(idx);
+        } else if let Some(idx) = approval.rejections.first_index_of(&signer) {
+            approval.rejections.remove(idx);
+        } else {
+            return Err(Error::NotVoted);
+        }
+
+        let old_status = approval.status.clone();
+        recompute_approval_status(&mut approval);
+        approval.updated_ledger = env.ledger().sequence();
+        save_approval(&env, invoice_id, &approval);
+
+        emit_cosigner_vote(&env, symbol_short!("revoked"), invoice_id, &signer, &approval);
+        if old_status != approval.status {
+            emit_approval_status_changed(&env, invoice_id, &old_status, &approval.status);
+        }
+        Ok(approval.status)
     }
 
     // -----------------------------------------------------------------------
@@ -818,6 +1083,28 @@ impl InvoiceEscrowContract {
         env.storage()
             .persistent()
             .get(&blacklist_key(&payer))
+    }
+
+    /// Return the full co-signer approval record for an invoice, if any.
+    pub fn get_approval(env: Env, invoice_id: u64) -> Option<CosignerApproval> {
+        get_approval(&env, invoice_id)
+    }
+
+    /// Return the aggregate co-signer approval status, or `None` when the
+    /// invoice has no co-signer requirement.
+    pub fn get_approval_status(env: Env, invoice_id: u64) -> Option<ApprovalStatus> {
+        get_approval(&env, invoice_id).map(|a| a.status)
+    }
+
+    /// Return `true` if `signer` has approved the invoice's release.
+    pub fn has_approved(env: Env, invoice_id: u64, signer: Address) -> bool {
+        get_approval(&env, invoice_id).map_or(false, |a| a.approvals.contains(&signer))
+    }
+
+    /// Return how many more approvals are needed to reach the threshold
+    /// (`0` when already approved or when no co-signers are configured).
+    pub fn approvals_remaining(env: Env, invoice_id: u64) -> u32 {
+        get_approval(&env, invoice_id).map_or(0, |a| a.threshold.saturating_sub(a.approvals.len()))
     }
 
     /// Return `true` if the payer is blacklisted with a finalised and upheld entry.
