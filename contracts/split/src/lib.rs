@@ -60,6 +60,7 @@ mod calc;
 mod stats;
 pub mod security_audit;
 pub mod payment_tracking;
+pub mod velocity;
 
 #[cfg(test)]
 mod test;
@@ -7302,6 +7303,9 @@ impl SplitContract {
                 .persistent()
                 .set(&global_vel_key(payer), &global_window);
         }
+
+        // Issue #912: contract-wide payment velocity limits (count, volume, cooldown).
+        velocity::enforce(env, payer, amount);
 
         let token_client = token::Client::new(env, &funding_token_for(&invoice));
 
@@ -15975,6 +15979,54 @@ impl SplitContract {
     /// Whether recipient at `index` has been fully paid.
     pub fn is_recipient_paid(env: Env, invoice_id: u64, index: u32) -> bool {
         payment_tracking::is_recipient_paid(&env, invoice_id, index)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #912: Payment velocity limits
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl SplitContract {
+    /// Set the default velocity limits applied to every payer. Admin only.
+    pub fn set_velocity_config(env: Env, config: velocity::VelocityConfig) {
+        require_admin(&env);
+        velocity::set_default_config(&env, &config);
+    }
+
+    /// Return the default velocity limits.
+    pub fn get_velocity_config(env: Env) -> velocity::VelocityConfig {
+        velocity::get_default_config(&env)
+    }
+
+    /// Set (`Some`) or clear (`None`) a per-payer velocity override. Admin only.
+    pub fn set_payer_velocity_override(
+        env: Env,
+        payer: Address,
+        config: Option<velocity::VelocityConfig>,
+    ) {
+        require_admin(&env);
+        velocity::set_payer_override(&env, &payer, &config);
+    }
+
+    /// Return the velocity limits that apply to `payer`.
+    pub fn get_payer_velocity_config(env: Env, payer: Address) -> velocity::VelocityConfig {
+        velocity::effective_config(&env, &payer)
+    }
+
+    /// Return the current velocity window state for `payer`.
+    pub fn get_payer_velocity_state(env: Env, payer: Address) -> velocity::VelocityState {
+        velocity::get_state(&env, &payer)
+    }
+
+    /// Whether a payment of `amount` from `payer` would pass velocity checks now.
+    pub fn check_payer_velocity(env: Env, payer: Address, amount: i128) -> bool {
+        velocity::would_allow(&env, &payer, amount)
+    }
+
+    /// Clear a payer's velocity state. Admin only.
+    pub fn reset_payer_velocity(env: Env, payer: Address) {
+        require_admin(&env);
+        velocity::reset_state(&env, &payer);
     }
 }
 

@@ -8995,3 +8995,157 @@ fn test_911_paid_bps_helper() {
     assert_eq!(payment_tracking::paid_bps(2_000, 1_000), 10_000);
     assert_eq!(payment_tracking::paid_bps(10, 0), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #912: Payment velocity limits
+// ---------------------------------------------------------------------------
+
+fn vel_cfg_912(max_payments: u32, max_amount: i128, window_secs: u64, cooldown_secs: u64) -> velocity::VelocityConfig {
+    velocity::VelocityConfig {
+        max_payments,
+        max_amount,
+        window_secs,
+        cooldown_secs,
+    }
+}
+
+#[test]
+fn test_912_check_disabled_config_has_no_limits() {
+    let cfg = velocity::VelocityConfig::default();
+    assert!(!cfg.is_enabled());
+}
+
+#[test]
+fn test_912_check_enforces_payment_count() {
+    let cfg = vel_cfg_912(2, 0, 100, 0);
+    let s0 = velocity::VelocityState::default();
+    let s1 = velocity::check(&cfg, &s0, 10, 1_000).unwrap();
+    let s2 = velocity::check(&cfg, &s1, 10, 1_001).unwrap();
+    assert_eq!(s2.payment_count, 2);
+    assert_eq!(
+        velocity::check(&cfg, &s2, 10, 1_002),
+        Err(ContractError::RateLimitExceeded)
+    );
+}
+
+#[test]
+fn test_912_check_enforces_amount_cap() {
+    let cfg = vel_cfg_912(0, 100, 100, 0);
+    let s0 = velocity::VelocityState::default();
+    let s1 = velocity::check(&cfg, &s0, 60, 1_000).unwrap();
+    assert_eq!(
+        velocity::check(&cfg, &s1, 41, 1_001),
+        Err(ContractError::RateLimitExceeded)
+    );
+    // Exactly at the cap is allowed.
+    let s2 = velocity::check(&cfg, &s1, 40, 1_001).unwrap();
+    assert_eq!(s2.amount_total, 100);
+}
+
+#[test]
+fn test_912_check_window_resets_after_elapsed() {
+    let cfg = vel_cfg_912(1, 0, 100, 0);
+    let s0 = velocity::VelocityState::default();
+    let s1 = velocity::check(&cfg, &s0, 10, 1_000).unwrap();
+    assert!(velocity::check(&cfg, &s1, 10, 1_099).is_err());
+    let s2 = velocity::check(&cfg, &s1, 10, 1_100).unwrap();
+    assert_eq!(s2.window_start, 1_100);
+    assert_eq!(s2.payment_count, 1);
+}
+
+#[test]
+fn test_912_check_enforces_cooldown() {
+    let cfg = vel_cfg_912(0, 0, 0, 30);
+    let s0 = velocity::VelocityState::default();
+    let s1 = velocity::check(&cfg, &s0, 10, 1_000).unwrap();
+    assert_eq!(
+        velocity::check(&cfg, &s1, 10, 1_029),
+        Err(ContractError::RateLimitExceeded)
+    );
+    assert!(velocity::check(&cfg, &s1, 10, 1_030).is_ok());
+}
+
+#[test]
+fn test_912_check_rejects_non_positive_and_overflow() {
+    let cfg = vel_cfg_912(0, 0, 0, 1);
+    let s0 = velocity::VelocityState::default();
+    assert_eq!(velocity::check(&cfg, &s0, 0, 1), Err(ContractError::InvalidAmount));
+    assert_eq!(velocity::check(&cfg, &s0, -5, 1), Err(ContractError::InvalidAmount));
+    let full = velocity::VelocityState {
+        window_start: 1,
+        payment_count: 1,
+        amount_total: i128::MAX,
+        last_payment_at: 0,
+    };
+    let cfg = vel_cfg_912(10, 0, 100, 0);
+    assert_eq!(
+        velocity::check(&cfg, &full, 1, 2),
+        Err(ContractError::ArithmeticOverflow)
+    );
+}
+
+#[test]
+fn test_912_invalid_config_rejected() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    // Window limit with zero window.
+    assert!(c.try_set_velocity_config(&vel_cfg_912(5, 0, 0, 0)).is_err());
+    // Negative amount cap.
+    assert!(c.try_set_velocity_config(&vel_cfg_912(0, -1, 10, 0)).is_err());
+}
+
+#[test]
+fn test_912_pay_blocked_after_payment_count_limit() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+    let id = make_invoice(&env, &c, &creator, &recipient, 1_000, &token_id, 99_999);
+
+    c.set_velocity_config(&vel_cfg_912(2, 0, 100, 0));
+    assert_eq!(c.get_velocity_config(), vel_cfg_912(2, 0, 100, 0));
+
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    c.pay(&payer, &id, &100_i128, &1_u64, &false, &false, &None);
+    assert_eq!(c.get_payer_velocity_state(&payer).payment_count, 2);
+    assert!(!c.check_payer_velocity(&payer, &100));
+    assert!(c
+        .try_pay(&payer, &id, &100_i128, &2_u64, &false, &false, &None)
+        .is_err());
+
+    // After the window elapses the payer may pay again.
+    env.ledger().set_timestamp(1_100);
+    assert!(c.check_payer_velocity(&payer, &100));
+    c.pay(&payer, &id, &100_i128, &2_u64, &false, &false, &None);
+}
+
+#[test]
+fn test_912_payer_override_and_reset() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let other = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+    let id = make_invoice(&env, &c, &creator, &recipient, 1_000, &token_id, 99_999);
+
+    c.set_velocity_config(&vel_cfg_912(5, 0, 100, 0));
+    c.set_payer_velocity_override(&payer, &Some(vel_cfg_912(1, 0, 100, 0)));
+    assert_eq!(c.get_payer_velocity_config(&payer).max_payments, 1);
+    assert_eq!(c.get_payer_velocity_config(&other).max_payments, 5);
+
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    assert!(!c.check_payer_velocity(&payer, &100));
+
+    c.reset_payer_velocity(&payer);
+    assert_eq!(c.get_payer_velocity_state(&payer), velocity::VelocityState::default());
+    assert!(c.check_payer_velocity(&payer, &100));
+
+    c.set_payer_velocity_override(&payer, &None);
+    assert_eq!(c.get_payer_velocity_config(&payer).max_payments, 5);
+}

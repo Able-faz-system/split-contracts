@@ -2017,6 +2017,27 @@ pub fn payment_milestone_state(env: &Env, invoice_id: u64, threshold_bps: u32, s
 }
 
 // ---------------------------------------------------------------------------
+// Issue #912: Payment velocity limit events
+// ---------------------------------------------------------------------------
+
+/// Emitted when the default (`payer = None`) or a per-payer velocity config
+/// is set. A cleared override is reported with all limits at zero.
+/// Topics: (split, vel_cfg)
+/// Data: (payer, max_payments, max_amount, window_secs)
+pub fn velocity_config_set(
+    env: &Env,
+    payer: Option<Address>,
+    max_payments: u32,
+    max_amount: i128,
+    window_secs: u64,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("vel_cfg")),
+        (payer, max_payments, max_amount, window_secs),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests for the per-invoice event sequence counter (issue #708)
 // ---------------------------------------------------------------------------
 
