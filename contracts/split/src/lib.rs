@@ -58,6 +58,7 @@ pub mod types;
 mod validation;
 mod calc;
 mod stats;
+pub mod security_audit;
 
 #[cfg(test)]
 mod test;
@@ -15845,6 +15846,75 @@ impl SplitContract {
         } else {
             ((invoice.funded * 10_000) / total) as u32
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #892: Contract security audit framework
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl SplitContract {
+    /// Register `auditor` as a trusted security auditor. Admin only.
+    pub fn add_security_auditor(env: Env, auditor: Address) {
+        require_admin(&env);
+        security_audit::add_auditor(&env, &auditor);
+    }
+
+    /// Remove a previously registered security auditor. Admin only.
+    pub fn remove_security_auditor(env: Env, auditor: Address) {
+        require_admin(&env);
+        security_audit::remove_auditor(&env, &auditor);
+    }
+
+    /// List all registered security auditors.
+    pub fn get_security_auditors(env: Env) -> Vec<Address> {
+        security_audit::get_auditors(&env)
+    }
+
+    /// Run the contract-level security audit and persist the report.
+    /// Callable by a registered auditor or the admin.
+    pub fn run_security_audit(env: Env, auditor: Address) -> security_audit::SecurityAuditReport {
+        security_audit::run_contract_audit(&env, &auditor)
+    }
+
+    /// Run the invoice-level security audit for `invoice_id` and persist the report.
+    /// Callable by a registered auditor or the admin.
+    pub fn run_invoice_security_audit(
+        env: Env,
+        auditor: Address,
+        invoice_id: u64,
+    ) -> security_audit::SecurityAuditReport {
+        security_audit::run_invoice_audit(&env, &auditor, invoice_id)
+    }
+
+    /// Fetch a stored security audit report by id.
+    pub fn get_security_audit(
+        env: Env,
+        audit_id: u64,
+    ) -> Option<security_audit::SecurityAuditReport> {
+        security_audit::get_report(&env, audit_id)
+    }
+
+    /// Total number of security audits run so far (also the latest audit id).
+    pub fn get_security_audit_count(env: Env) -> u64 {
+        security_audit::get_audit_count(&env)
+    }
+
+    /// Append an entry to the bounded security event log.
+    /// Callable by a registered auditor or the admin.
+    pub fn log_security_event(
+        env: Env,
+        reporter: Address,
+        kind: Symbol,
+        severity: security_audit::AuditSeverity,
+        invoice_id: Option<u64>,
+    ) {
+        security_audit::log_security_event(&env, &reporter, kind, severity, invoice_id);
+    }
+
+    /// Return the security event log, oldest entry first.
+    pub fn get_security_events(env: Env) -> Vec<security_audit::SecurityEvent> {
+        security_audit::get_security_events(&env)
     }
 }
 

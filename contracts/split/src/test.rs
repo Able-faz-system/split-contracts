@@ -8688,3 +8688,128 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
     assert!(id3 >= 1);
 }
 
+
+// ---------------------------------------------------------------------------
+// Issue #892: Contract security audit framework
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_892_add_and_remove_security_auditor() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let auditor = Address::generate(&env);
+
+    c.add_security_auditor(&auditor);
+    assert!(c.get_security_auditors().contains(&auditor));
+
+    // Adding twice is idempotent.
+    c.add_security_auditor(&auditor);
+    assert_eq!(c.get_security_auditors().len(), 1);
+
+    c.remove_security_auditor(&auditor);
+    assert!(c.get_security_auditors().is_empty());
+}
+
+#[test]
+fn test_892_contract_audit_passes_on_initialized_contract() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let auditor = Address::generate(&env);
+    c.add_security_auditor(&auditor);
+
+    let report = c.run_security_audit(&auditor);
+    assert_eq!(report.audit_id, 1);
+    assert_eq!(report.invoice_id, None);
+    assert_eq!(report.failed_count, 0);
+    assert_eq!(report.critical_failures, 0);
+    assert_eq!(report.risk_score, 0);
+    assert_eq!(report.passed_count, report.findings.len());
+
+    assert_eq!(c.get_security_audit_count(), 1);
+    assert_eq!(c.get_security_audit(&1), Some(report));
+}
+
+#[test]
+fn test_892_contract_audit_flags_paused_contract_as_info() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let auditor = Address::generate(&env);
+    c.add_security_auditor(&auditor);
+
+    let admin: Address = env.as_contract(&contract_id, || {
+        env.storage().instance().get(&admin_key()).unwrap()
+    });
+    c.pause(&admin);
+    let report = c.run_security_audit(&auditor);
+    assert_eq!(report.failed_count, 1);
+    assert_eq!(report.risk_score, 0);
+    let failed = report.findings.iter().find(|f| !f.passed).unwrap();
+    assert_eq!(failed.check, symbol_short!("not_psd"));
+    assert_eq!(failed.severity, security_audit::AuditSeverity::Info);
+}
+
+#[test]
+fn test_892_invoice_audit_passes_for_valid_invoice() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let auditor = Address::generate(&env);
+    c.add_security_auditor(&auditor);
+
+    env.ledger().set_timestamp(1_000);
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+
+    let report = c.run_invoice_security_audit(&auditor, &id);
+    assert_eq!(report.invoice_id, Some(id));
+    assert_eq!(report.failed_count, 0);
+    assert_eq!(c.get_security_audit_count(), 1);
+}
+
+#[test]
+#[should_panic(expected = "caller is not a registered auditor")]
+fn test_892_unregistered_auditor_cannot_run_audit() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    c.run_security_audit(&Address::generate(&env));
+}
+
+#[test]
+#[should_panic(expected = "auditor not registered")]
+fn test_892_remove_unknown_auditor_panics() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    c.remove_security_auditor(&Address::generate(&env));
+}
+
+#[test]
+fn test_892_security_event_log_is_bounded() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let auditor = Address::generate(&env);
+    c.add_security_auditor(&auditor);
+
+    for _ in 0..(security_audit::MAX_SECURITY_EVENTS + 5) {
+        c.log_security_event(
+            &auditor,
+            &symbol_short!("susp_pay"),
+            &security_audit::AuditSeverity::High,
+            &Some(7u64),
+        );
+    }
+    let log = c.get_security_events();
+    assert_eq!(log.len(), security_audit::MAX_SECURITY_EVENTS);
+    let first = log.get(0).unwrap();
+    assert_eq!(first.reporter, auditor);
+    assert_eq!(first.invoice_id, Some(7u64));
+    assert_eq!(first.severity, security_audit::AuditSeverity::High);
+}
+
+#[test]
+fn test_892_severity_weights_are_monotonic() {
+    use security_audit::AuditSeverity;
+    assert!(AuditSeverity::Info.weight() < AuditSeverity::Low.weight());
+    assert!(AuditSeverity::Low.weight() < AuditSeverity::Medium.weight());
+    assert!(AuditSeverity::Medium.weight() < AuditSeverity::High.weight());
+    assert!(AuditSeverity::High.weight() < AuditSeverity::Critical.weight());
+}

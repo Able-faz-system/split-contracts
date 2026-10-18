@@ -27,7 +27,7 @@
 
 use crate::storage_keys::ev_seq_key;
 use crate::types::{DisputeOutcome, FeeSplit, InvoicePhase, InvoiceStatus, OverfundingPolicy, RepScore, TimelockAction};
-use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String, Vec};
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec};
 
 // ---------------------------------------------------------------------------
 // Event sequence helper (per-invoice, temporary-storage counter)
@@ -1911,6 +1911,64 @@ pub fn deadline_extended(env: &Env, invoice_id: u64, old_deadline: u64, new_dead
     env.events().publish(
         (symbol_short!("split"), symbol_short!("dl_ext"), invoice_id),
         (old_deadline, new_deadline),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #892: Security audit framework events
+// ---------------------------------------------------------------------------
+
+/// Emitted when an auditor is registered (`added = true`) or removed.
+/// Topics: (split, sec_adtr)
+/// Data: (auditor, added)
+pub fn security_auditor_updated(env: &Env, auditor: &Address, added: bool) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("sec_adtr")),
+        (auditor.clone(), added),
+    );
+}
+
+/// Emitted when a security audit run completes.
+/// Topics: (split, sec_aud, audit_id)
+/// Data: (auditor, invoice_id, failed_count, risk_score, ledger)
+pub fn security_audit_completed(
+    env: &Env,
+    audit_id: u64,
+    auditor: &Address,
+    invoice_id: Option<u64>,
+    failed_count: u32,
+    risk_score: u32,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("sec_aud"), audit_id),
+        (
+            auditor.clone(),
+            invoice_id,
+            failed_count,
+            risk_score,
+            env.ledger().sequence(),
+        ),
+    );
+}
+
+/// Emitted when an auditor logs a security event.
+/// Topics: (split, sec_evt, kind)
+/// Data: (reporter, severity, invoice_id, timestamp)
+pub fn security_event_logged(
+    env: &Env,
+    reporter: &Address,
+    kind: &Symbol,
+    severity: u32,
+    invoice_id: Option<u64>,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("sec_evt"), kind.clone()),
+        (
+            reporter.clone(),
+            severity,
+            invoice_id,
+            env.ledger().timestamp(),
+        ),
     );
 }
 
