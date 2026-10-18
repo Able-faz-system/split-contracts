@@ -2038,6 +2038,21 @@ pub fn velocity_config_set(
 }
 
 // ---------------------------------------------------------------------------
+// Issue #913: Split rules engine events
+// ---------------------------------------------------------------------------
+
+/// Emitted when an invoice's split rules are set (`rule_count > 0`) or cleared.
+/// Topics: (split, srules, invoice_id)
+/// Data: (rule_count, event_seq)
+pub fn split_rules_set(env: &Env, invoice_id: u64, rule_count: u32) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("srules"), invoice_id),
+        (rule_count, event_seq),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests for the per-invoice event sequence counter (issue #708)
 // ---------------------------------------------------------------------------
 

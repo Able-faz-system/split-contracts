@@ -61,6 +61,7 @@ mod stats;
 pub mod security_audit;
 pub mod payment_tracking;
 pub mod velocity;
+pub mod split_rules;
 
 #[cfg(test)]
 mod test;
@@ -16027,6 +16028,52 @@ impl SplitContract {
     pub fn reset_payer_velocity(env: Env, payer: Address) {
         require_admin(&env);
         velocity::reset_state(&env, &payer);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #913: Split rules engine
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl SplitContract {
+    /// Attach criteria-based split rules to a pending invoice. Creator only.
+    pub fn set_invoice_split_rules(
+        env: Env,
+        creator: Address,
+        invoice_id: u64,
+        rules: Vec<split_rules::SplitRuleDef>,
+    ) {
+        require_not_paused(&env);
+        split_rules::set_rules(&env, &creator, invoice_id, rules);
+    }
+
+    /// Remove the split rules from a pending invoice. Creator only.
+    pub fn clear_invoice_split_rules(env: Env, creator: Address, invoice_id: u64) {
+        require_not_paused(&env);
+        split_rules::clear_rules(&env, &creator, invoice_id);
+    }
+
+    /// Return the split rules stored for an invoice (empty if none).
+    pub fn get_invoice_split_rules(env: Env, invoice_id: u64) -> Vec<split_rules::SplitRuleDef> {
+        split_rules::get_rules(&env, invoice_id)
+    }
+
+    /// Evaluate an invoice's split rules against its current funded amount,
+    /// payment count and the ledger timestamp. Returns one amount per recipient.
+    pub fn evaluate_invoice_split_rules(env: Env, invoice_id: u64) -> Vec<i128> {
+        split_rules::evaluate_for_invoice(&env, invoice_id)
+    }
+
+    /// Validate and evaluate `rules` against an arbitrary context without
+    /// storing anything. Useful for previewing a rule set before attaching it.
+    pub fn preview_split_rules(
+        env: Env,
+        rules: Vec<split_rules::SplitRuleDef>,
+        recipient_count: u32,
+        context: split_rules::RuleContext,
+    ) -> Vec<i128> {
+        split_rules::validate_rules(&rules, recipient_count);
+        split_rules::evaluate(&env, &rules, recipient_count, &context)
     }
 }
 

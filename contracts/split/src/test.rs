@@ -9149,3 +9149,228 @@ fn test_912_payer_override_and_reset() {
     c.set_payer_velocity_override(&payer, &None);
     assert_eq!(c.get_payer_velocity_config(&payer).max_payments, 5);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #913: Split rules engine
+// ---------------------------------------------------------------------------
+
+fn rule_913(
+    recipient_index: u32,
+    priority: u32,
+    criteria: split_rules::RuleCriteria,
+    amount: split_rules::RuleAmount,
+) -> split_rules::SplitRuleDef {
+    split_rules::SplitRuleDef {
+        recipient_index,
+        priority,
+        criteria,
+        amount,
+    }
+}
+
+fn ctx_913(funded: i128, payer_count: u32, timestamp: u64) -> split_rules::RuleContext {
+    split_rules::RuleContext {
+        funded,
+        payer_count,
+        timestamp,
+    }
+}
+
+fn setup_913() -> (Env, Address, Address, u64) {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+    let creator = Address::generate(&env);
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(Address::generate(&env));
+    recipients.push_back(Address::generate(&env));
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(500_i128);
+    amounts.push_back(500_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &99_999, &default_options(&env));
+    (env, contract_id, creator, id)
+}
+
+#[test]
+fn test_913_evaluate_fixed_percentage_and_remainder() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Fixed(100)));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Percentage(2_500)));
+    rules.push_back(rule_913(2, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    split_rules::validate_rules(&rules, 3);
+
+    let out = split_rules::evaluate(&env, &rules, 3, &ctx_913(1_000, 1, 0));
+    assert_eq!(out.get(0).unwrap(), 100);
+    assert_eq!(out.get(1).unwrap(), 250);
+    assert_eq!(out.get(2).unwrap(), 650);
+}
+
+#[test]
+fn test_913_first_matching_rule_by_priority_wins() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    // Bonus tier once funding reaches 1_000, otherwise a base percentage.
+    rules.push_back(rule_913(0, 1, RuleCriteria::Always, RuleAmount::Percentage(1_000)));
+    rules.push_back(rule_913(0, 0, RuleCriteria::FundedAtLeast(1_000), RuleAmount::Percentage(3_000)));
+    split_rules::validate_rules(&rules, 1);
+
+    let low = split_rules::evaluate(&env, &rules, 1, &ctx_913(500, 0, 0));
+    assert_eq!(low.get(0).unwrap(), 50);
+    let high = split_rules::evaluate(&env, &rules, 1, &ctx_913(1_000, 0, 0));
+    assert_eq!(high.get(0).unwrap(), 300);
+}
+
+#[test]
+fn test_913_criteria_matching() {
+    use split_rules::{criteria_matches, RuleCriteria};
+    let ctx = ctx_913(100, 3, 50);
+    assert!(criteria_matches(&RuleCriteria::Always, &ctx));
+    assert!(criteria_matches(&RuleCriteria::FundedAtLeast(100), &ctx));
+    assert!(!criteria_matches(&RuleCriteria::FundedBelow(100), &ctx));
+    assert!(criteria_matches(&RuleCriteria::PayerCountAtLeast(3), &ctx));
+    assert!(!criteria_matches(&RuleCriteria::PayerCountAtLeast(4), &ctx));
+    assert!(criteria_matches(&RuleCriteria::AfterTimestamp(50), &ctx));
+    assert!(!criteria_matches(&RuleCriteria::BeforeTimestamp(50), &ctx));
+}
+
+#[test]
+fn test_913_unmatched_recipient_gets_zero() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::AfterTimestamp(100), RuleAmount::Fixed(10)));
+    let out = split_rules::evaluate(&env, &rules, 2, &ctx_913(1_000, 0, 50));
+    assert_eq!(out.get(0).unwrap(), 0);
+    assert_eq!(out.get(1).unwrap(), 0);
+}
+
+#[test]
+fn test_913_zero_funded_yields_zero_amounts() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Percentage(5_000)));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    let out = split_rules::evaluate(&env, &rules, 2, &ctx_913(0, 0, 0));
+    assert_eq!(out.get(0).unwrap(), 0);
+    assert_eq!(out.get(1).unwrap(), 0);
+}
+
+#[test]
+#[should_panic(expected = "split rules exceed funded amount")]
+fn test_913_fixed_exceeding_funded_panics() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Fixed(1_001)));
+    split_rules::evaluate(&env, &rules, 1, &ctx_913(1_000, 0, 0));
+}
+
+#[test]
+#[should_panic(expected = "rule recipient index out of range")]
+fn test_913_validate_index_out_of_range() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(2, 0, RuleCriteria::Always, RuleAmount::Fixed(1)));
+    split_rules::validate_rules(&rules, 2);
+}
+
+#[test]
+#[should_panic(expected = "duplicate rule priority for recipient")]
+fn test_913_validate_duplicate_priority() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Fixed(1)));
+    rules.push_back(rule_913(0, 0, RuleCriteria::FundedAtLeast(5), RuleAmount::Fixed(2)));
+    split_rules::validate_rules(&rules, 1);
+}
+
+#[test]
+#[should_panic(expected = "only one recipient may take the remainder")]
+fn test_913_validate_multiple_remainders() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    split_rules::validate_rules(&rules, 2);
+}
+
+#[test]
+#[should_panic(expected = "unconditional percentages exceed 100%")]
+fn test_913_validate_percentages_over_100() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Percentage(6_000)));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Percentage(5_000)));
+    split_rules::validate_rules(&rules, 2);
+}
+
+#[test]
+#[should_panic(expected = "rule percentage must be 1..=10000 bps")]
+fn test_913_validate_zero_percentage() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Percentage(0)));
+    split_rules::validate_rules(&rules, 1);
+}
+
+#[test]
+#[should_panic(expected = "split rules must not be empty")]
+fn test_913_validate_empty_rules() {
+    let env = Env::default();
+    split_rules::validate_rules(&Vec::new(&env), 1);
+}
+
+#[test]
+fn test_913_rules_persist_on_invoice_and_evaluate() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let (env, contract_id, creator, id) = setup_913();
+    let c = client(&env, &contract_id);
+
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Percentage(4_000)));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    c.set_invoice_split_rules(&creator, &id, &rules);
+    assert_eq!(c.get_invoice_split_rules(&id), rules);
+
+    // Nothing funded yet.
+    let out = c.evaluate_invoice_split_rules(&id);
+    assert_eq!(out.len(), 2);
+    assert_eq!(out.get(0).unwrap(), 0);
+    assert_eq!(out.get(1).unwrap(), 0);
+
+    c.clear_invoice_split_rules(&creator, &id);
+    assert!(c.get_invoice_split_rules(&id).is_empty());
+}
+
+#[test]
+fn test_913_preview_split_rules() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let (env, contract_id, _creator, _id) = setup_913();
+    let c = client(&env, &contract_id);
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Fixed(300)));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    let out = c.preview_split_rules(&rules, &2, &ctx_913(1_000, 2, 1_000));
+    assert_eq!(out.get(0).unwrap(), 300);
+    assert_eq!(out.get(1).unwrap(), 700);
+}
+
+#[test]
+#[should_panic(expected = "only the creator can set split rules")]
+fn test_913_non_creator_cannot_set_rules() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let (env, contract_id, _creator, id) = setup_913();
+    let c = client(&env, &contract_id);
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Fixed(1)));
+    c.set_invoice_split_rules(&Address::generate(&env), &id, &rules);
+}
