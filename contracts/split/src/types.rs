@@ -1900,6 +1900,66 @@ pub struct CloneRecord {
     pub ledger: u32,
 }
 
+/// Issue #927: Lifecycle of an invoice with respect to archival.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ArchivalStatus {
+    /// Never archived — lives in persistent storage.
+    Active,
+    /// Moved to cold (instance) storage.
+    Archived,
+    /// Recovered from the archive back into persistent storage.
+    Restored,
+    /// Archived and cleaned up past the retention period (payments dropped).
+    Purged,
+}
+
+/// Issue #927: Per-invoice archival status tracking.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ArchivalRecord {
+    pub status: ArchivalStatus,
+    pub archived_at_ledger: u32,
+    /// `None` for lazy / explicit archival with no authenticated actor.
+    pub archived_by: Option<Address>,
+    pub restored_at_ledger: Option<u32>,
+    pub restored_by: Option<Address>,
+    pub purged_at_ledger: Option<u32>,
+    /// Number of times this invoice has been archived.
+    pub archive_count: u32,
+}
+
+/// Issue #927: Admin-configured archival schedule and cleanup policy.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ArchivalPolicy {
+    /// Whether `run_archival_sweep` may run.
+    pub enabled: bool,
+    /// Minimum ledgers between two sweeps.
+    pub sweep_interval_ledgers: u32,
+    /// Invoice IDs scanned per sweep (1–50).
+    pub max_batch: u32,
+    /// Ledgers an archived invoice is retained before it may be purged;
+    /// 0 disables purging.
+    pub retention_ledgers: u32,
+    /// Purge eligible invoices during sweeps.
+    pub auto_purge: bool,
+    /// Ledgers a restored invoice is exempt from re-archival.
+    pub restore_hold_ledgers: u32,
+}
+
+/// Issue #927: Aggregate archival counters.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ArchivalStats {
+    pub total_archived: u64,
+    pub total_restored: u64,
+    pub total_purged: u64,
+    pub last_sweep_ledger: u32,
+    /// Last invoice ID scanned by the sweep; wraps to 0 at the end.
+    pub sweep_cursor: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::InvoiceStatus;

@@ -87,7 +87,8 @@ use soroban_sdk::{
 const MAX_PARENT_DEPTH: u32 = 10;
 
 use types::{
-    AdminAction, AdminRole, AdminSet, AuditEntry, Bid, CircuitBreakerStatus,
+    AdminAction, AdminRole, AdminSet, ArchivalPolicy, ArchivalRecord, ArchivalStats,
+    ArchivalStatus, AuditEntry, Bid, CircuitBreakerStatus,
     CloneOverrides, CloneRecord, CompactInvoice, CompactMigrateResult, CompletionProof, ComputeEstimate,
     ConfidentialPayment, ContributionResult, CreateInvoiceParams, CreatorStats, DelayedPayout,
     DisputeOutcome, DisputeRecord, DisputeStatus, FeeBracket, FeeSplit, FeeTier, InstalmentPlan,
@@ -1801,7 +1802,13 @@ fn maybe_archive_invoice(env: &Env, id: u64) {
         return;
     }
 
+    // Issue #927: a recently restored invoice is held out of lazy archival.
+    if in_restore_hold(env, id) {
+        return;
+    }
+
     archive_invoice_storage(env, id, &core);
+    record_archived(env, id, None);
     events::invoice_archived(env, id);
 }
 
@@ -13372,6 +13379,7 @@ impl SplitContract {
             .persistent()
             .remove(&invoice_ext2_key(invoice_id));
 
+        record_archived(&env, invoice_id, None);
         events::invoice_archived(&env, invoice_id);
     }
 
@@ -13487,6 +13495,7 @@ impl SplitContract {
                 env.storage().persistent().remove(&invoice_ext2_key(id));
 
                 archived.push_back(id);
+                record_archived(&env, id, None);
                 events::invoice_archived(&env, id);
             }
         }
@@ -15124,6 +15133,179 @@ fn transfer_audit_key(invoice_id: u64) -> (Symbol, u64) {
     (symbol_short!("audit_log"), invoice_id)
 }
 
+fn archival_record_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("arch_rec"), id)
+}
+
+fn archival_policy_key() -> Symbol {
+    symbol_short!("arch_pol")
+}
+
+fn archival_stats_key() -> Symbol {
+    symbol_short!("arch_stat")
+}
+
+/// Issue #927: default archival policy — sweeps disabled until an admin opts in.
+fn default_archival_policy() -> ArchivalPolicy {
+    ArchivalPolicy {
+        enabled: false,
+        sweep_interval_ledgers: 17_280,
+        max_batch: 20,
+        retention_ledgers: 0,
+        auto_purge: false,
+        restore_hold_ledgers: ARCHIVE_AFTER_LEDGERS as u32,
+    }
+}
+
+fn load_archival_policy(env: &Env) -> ArchivalPolicy {
+    env.storage()
+        .instance()
+        .get(&archival_policy_key())
+        .unwrap_or_else(default_archival_policy)
+}
+
+fn load_archival_stats(env: &Env) -> ArchivalStats {
+    env.storage()
+        .instance()
+        .get(&archival_stats_key())
+        .unwrap_or(ArchivalStats {
+            total_archived: 0,
+            total_restored: 0,
+            total_purged: 0,
+            last_sweep_ledger: 0,
+            sweep_cursor: 0,
+        })
+}
+
+fn save_archival_stats(env: &Env, stats: &ArchivalStats) {
+    env.storage().instance().set(&archival_stats_key(), stats);
+}
+
+fn load_archival_record(env: &Env, id: u64) -> Option<ArchivalRecord> {
+    env.storage().persistent().get(&archival_record_key(id))
+}
+
+fn save_archival_record(env: &Env, id: u64, record: &ArchivalRecord) {
+    env.storage().persistent().set(&archival_record_key(id), record);
+    env.storage().persistent().extend_ttl(
+        &archival_record_key(id),
+        INVOICE_HOT_TTL_LEDGERS / 2,
+        INVOICE_HOT_TTL_LEDGERS,
+    );
+}
+
+/// Issue #927: true while a restored invoice is still inside its hold window.
+fn in_restore_hold(env: &Env, id: u64) -> bool {
+    match load_archival_record(env, id) {
+        Some(record) if record.status == ArchivalStatus::Restored => {
+            let restored_at = record.restored_at_ledger.unwrap_or(0);
+            let hold = load_archival_policy(env).restore_hold_ledgers;
+            env.ledger().sequence().saturating_sub(restored_at) < hold
+        }
+        _ => false,
+    }
+}
+
+/// Issue #927: invoice data lives in instance storage once archived.
+fn is_invoice_archived(env: &Env, id: u64) -> bool {
+    if env.storage().instance().has(&archive_marker_key(id))
+        || env.storage().persistent().has(&archive_marker_key(id))
+    {
+        return true;
+    }
+    matches!(
+        load_archival_record(env, id),
+        Some(ArchivalRecord { status: ArchivalStatus::Archived, .. })
+            | Some(ArchivalRecord { status: ArchivalStatus::Purged, .. })
+    )
+}
+
+/// Issue #927: track archival status, update stats and the audit trail.
+fn record_archived(env: &Env, id: u64, actor: Option<Address>) {
+    let previous = load_archival_record(env, id);
+    let archive_count = previous.as_ref().map(|r| r.archive_count).unwrap_or(0) + 1;
+    let record = ArchivalRecord {
+        status: ArchivalStatus::Archived,
+        archived_at_ledger: env.ledger().sequence(),
+        archived_by: actor.clone(),
+        restored_at_ledger: None,
+        restored_by: None,
+        purged_at_ledger: None,
+        archive_count,
+    };
+    save_archival_record(env, id, &record);
+
+    let mut stats = load_archival_stats(env);
+    stats.total_archived = stats.total_archived.saturating_add(1);
+    save_archival_stats(env, &stats);
+
+    let audit_actor = actor.unwrap_or_else(|| env.current_contract_address());
+    append_audit_entry(env, id, symbol_short!("archived"), &audit_actor);
+}
+
+/// Issue #927: an invoice qualifies for scheduled archival when it is
+/// completed, older than `archive_after_ledgers`, not already archived and
+/// not inside a post-restore hold.
+fn is_archival_eligible(env: &Env, id: u64) -> bool {
+    if is_invoice_archived(env, id) || in_restore_hold(env, id) {
+        return false;
+    }
+    let core: InvoiceCore = match env.storage().persistent().get(&invoice_key(id)) {
+        Some(core) => core,
+        None => return false,
+    };
+    if core.status != InvoiceStatus::Released && core.status != InvoiceStatus::Refunded {
+        return false;
+    }
+    let created_ledger: u32 = env
+        .storage()
+        .persistent()
+        .get(&created_ledger_key(id))
+        .or_else(|| env.storage().instance().get(&created_ledger_key(id)))
+        .unwrap_or_else(|| env.ledger().sequence());
+    let archive_after: u64 = env
+        .storage()
+        .instance()
+        .get(&archive_after_ledgers_key())
+        .unwrap_or(ARCHIVE_AFTER_LEDGERS);
+    (env.ledger().sequence() as u64).saturating_sub(created_ledger as u64) >= archive_after
+}
+
+/// Issue #927: true when an archived invoice has outlived the retention period.
+fn is_purge_eligible(env: &Env, id: u64, policy: &ArchivalPolicy) -> bool {
+    if policy.retention_ledgers == 0 {
+        return false;
+    }
+    match load_archival_record(env, id) {
+        Some(record) if record.status == ArchivalStatus::Archived => {
+            env.ledger().sequence().saturating_sub(record.archived_at_ledger)
+                >= policy.retention_ledgers
+        }
+        _ => false,
+    }
+}
+
+/// Issue #927: cleanup — drop the bulky payment shards of an archived invoice
+/// while keeping the invoice record, compact overlay and audit log readable.
+fn purge_archived_invoice(env: &Env, id: u64, actor: &Address) {
+    for shard_id in 0..SHARD_COUNT {
+        let shard_key = pay_shard_key(id, shard_id);
+        env.storage().instance().remove(&shard_key);
+        env.storage().persistent().remove(&shard_key);
+    }
+    let mut record = load_archival_record(env, id).expect("archival record not found");
+    record.status = ArchivalStatus::Purged;
+    record.purged_at_ledger = Some(env.ledger().sequence());
+    save_archival_record(env, id, &record);
+
+    let mut stats = load_archival_stats(env);
+    stats.total_purged = stats.total_purged.saturating_add(1);
+    save_archival_stats(env, &stats);
+
+    append_audit_entry(env, id, symbol_short!("purged"), actor);
+    events::invoice_archive_purged(env, id);
+}
+
 fn clone_record_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("clone_rec"), id)
 }
@@ -16062,4 +16244,202 @@ fn archive_invoice(env: &Env, invoice_id: u64, invoice: &Invoice) {
         .persistent()
         .set(&archived_key(invoice_id), &core);
     remove_invoice(env, invoice_id);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #927: Invoice archival system — schedule, recovery, cleanup, status
+// ---------------------------------------------------------------------------
+
+#[contractimpl]
+impl SplitContract {
+    /// Configure the scheduled archival policy. Operator role or higher.
+    pub fn set_archival_policy(env: Env, admin: Address, policy: ArchivalPolicy) {
+        require_admin_role(&env, &admin, AdminRole::Operator);
+        assert!(policy.max_batch > 0 && policy.max_batch <= 50, "invalid archival batch size");
+        assert!(policy.sweep_interval_ledgers > 0, "sweep interval must be positive");
+        env.storage().instance().set(&archival_policy_key(), &policy);
+        events::archival_policy_updated(&env, &admin, policy.enabled, policy.retention_ledgers);
+    }
+
+    /// Return the active archival policy (defaults when never configured).
+    pub fn get_archival_policy(env: Env) -> ArchivalPolicy {
+        load_archival_policy(&env)
+    }
+
+    /// Return aggregate archival counters and the sweep cursor.
+    pub fn get_archival_stats(env: Env) -> ArchivalStats {
+        load_archival_stats(&env)
+    }
+
+    /// Return the archival status record for an invoice. Invoices that were
+    /// never archived report `Active`.
+    pub fn get_archival_status(env: Env, invoice_id: u64) -> ArchivalRecord {
+        load_archival_record(&env, invoice_id).unwrap_or(ArchivalRecord {
+            status: ArchivalStatus::Active,
+            archived_at_ledger: 0,
+            archived_by: None,
+            restored_at_ledger: None,
+            restored_by: None,
+            purged_at_ledger: None,
+            archive_count: 0,
+        })
+    }
+
+    /// Scheduled archival sweep. Permissionless so keepers can drive it, but
+    /// rate-limited to once per `sweep_interval_ledgers`.
+    ///
+    /// Scans up to `max_batch` invoice IDs from the stored cursor, archives
+    /// every eligible one, and — when `auto_purge` is set — purges archived
+    /// invoices past the retention period. Returns the IDs archived this run.
+    pub fn run_archival_sweep(env: Env) -> Vec<u64> {
+        require_not_paused(&env);
+        let policy = load_archival_policy(&env);
+        assert!(policy.enabled, "archival sweep disabled");
+
+        let mut stats = load_archival_stats(&env);
+        let now = env.ledger().sequence();
+        if stats.last_sweep_ledger != 0 {
+            assert!(
+                now.saturating_sub(stats.last_sweep_ledger) >= policy.sweep_interval_ledgers,
+                "archival sweep not due"
+            );
+        }
+
+        let last_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&counter_key())
+            .unwrap_or(0u64);
+        let mut archived: Vec<u64> = Vec::new(&env);
+        let mut cursor = stats.sweep_cursor;
+        let contract = env.current_contract_address();
+
+        for _ in 0..policy.max_batch {
+            if cursor >= last_id {
+                cursor = 0;
+                break;
+            }
+            cursor += 1;
+            let id = cursor;
+            if is_archival_eligible(&env, id) {
+                let core: InvoiceCore = env.storage().persistent().get(&invoice_key(id)).unwrap();
+                archive_invoice_storage(&env, id, &core);
+                record_archived(&env, id, Some(contract.clone()));
+                events::invoice_archived(&env, id);
+                archived.push_back(id);
+            } else if policy.auto_purge && is_purge_eligible(&env, id, &policy) {
+                purge_archived_invoice(&env, id, &contract);
+            }
+        }
+
+        // `record_archived` / `purge_archived_invoice` update the counters, so
+        // reload before writing the cursor back.
+        stats = load_archival_stats(&env);
+        stats.sweep_cursor = cursor;
+        stats.last_sweep_ledger = now;
+        save_archival_stats(&env, &stats);
+
+        events::archival_sweep_completed(&env, archived.len(), cursor);
+        archived
+    }
+
+    /// Recovery: move an archived invoice back into persistent storage so it
+    /// becomes fully mutable again. Callable by the invoice creator or an
+    /// Operator admin. The invoice is held out of re-archival for
+    /// `restore_hold_ledgers`.
+    pub fn restore_archived_invoice(env: Env, caller: Address, invoice_id: u64) {
+        require_not_paused(&env);
+        assert!(is_invoice_archived(&env, invoice_id), "invoice not archived");
+        if let Some(record) = load_archival_record(&env, invoice_id) {
+            assert!(
+                record.status != ArchivalStatus::Purged,
+                "purged invoice cannot be restored"
+            );
+        }
+
+        let core: InvoiceCore = env
+            .storage()
+            .instance()
+            .get(&invoice_key(invoice_id))
+            .or_else(|| env.storage().persistent().get(&invoice_key(invoice_id)))
+            .expect("invoice not found");
+        if caller == core.creator {
+            caller.require_auth();
+        } else {
+            require_admin_role(&env, &caller, AdminRole::Operator);
+        }
+
+        let instance = env.storage().instance();
+        let persistent = env.storage().persistent();
+        persistent.set(&invoice_key(invoice_id), &core);
+        instance.remove(&invoice_key(invoice_id));
+        if let Some(ext) = instance.get::<_, InvoiceExt>(&invoice_ext_key(invoice_id)) {
+            persistent.set(&invoice_ext_key(invoice_id), &ext);
+            instance.remove(&invoice_ext_key(invoice_id));
+        }
+        if let Some(ext2) = instance.get::<_, InvoiceExt2>(&invoice_ext2_key(invoice_id)) {
+            persistent.set(&invoice_ext2_key(invoice_id), &ext2);
+            instance.remove(&invoice_ext2_key(invoice_id));
+        }
+        if let Some(compact) = instance.get::<_, CompactInvoice>(&invoice_compact_key(invoice_id)) {
+            persistent.set(&invoice_compact_key(invoice_id), &compact);
+            instance.remove(&invoice_compact_key(invoice_id));
+        }
+        for shard_id in 0..SHARD_COUNT {
+            let shard_key = pay_shard_key(invoice_id, shard_id);
+            if let Some(payments) = instance.get::<(Symbol, u64, u64), Vec<Payment>>(&shard_key) {
+                persistent.set(&shard_key, &payments);
+                instance.remove(&shard_key);
+            }
+        }
+        if let Some(log) = instance.get::<_, Vec<AuditEntry>>(&audit_log_key(invoice_id)) {
+            persistent.set(&audit_log_key(invoice_id), &log);
+            instance.remove(&audit_log_key(invoice_id));
+        }
+        if let Some(created) = instance.get::<_, u32>(&created_ledger_key(invoice_id)) {
+            persistent.set(&created_ledger_key(invoice_id), &created);
+            instance.remove(&created_ledger_key(invoice_id));
+        }
+        instance.remove(&archive_marker_key(invoice_id));
+        persistent.remove(&archive_marker_key(invoice_id));
+        bump_invoice_entry_ttl(&env, invoice_id);
+
+        let mut record = load_archival_record(&env, invoice_id).unwrap_or(ArchivalRecord {
+            status: ArchivalStatus::Archived,
+            archived_at_ledger: 0,
+            archived_by: None,
+            restored_at_ledger: None,
+            restored_by: None,
+            purged_at_ledger: None,
+            archive_count: 1,
+        });
+        record.status = ArchivalStatus::Restored;
+        record.restored_at_ledger = Some(env.ledger().sequence());
+        record.restored_by = Some(caller.clone());
+        save_archival_record(&env, invoice_id, &record);
+
+        let mut stats = load_archival_stats(&env);
+        stats.total_restored = stats.total_restored.saturating_add(1);
+        save_archival_stats(&env, &stats);
+
+        append_audit_entry(&env, invoice_id, symbol_short!("restored"), &caller);
+        events::invoice_restored(&env, invoice_id, &caller);
+    }
+
+    /// Cleanup policy: purge archived invoices that have outlived
+    /// `retention_ledgers`. Operator role or higher. Invoices not yet past
+    /// retention are skipped. Returns the IDs purged.
+    pub fn purge_archived_invoices(env: Env, admin: Address, invoice_ids: Vec<u64>) -> Vec<u64> {
+        require_admin_role(&env, &admin, AdminRole::Operator);
+        assert!(invoice_ids.len() <= 20, "batch limit exceeded");
+        let policy = load_archival_policy(&env);
+        let mut purged: Vec<u64> = Vec::new(&env);
+        for id in invoice_ids.iter() {
+            if is_purge_eligible(&env, id, &policy) {
+                purge_archived_invoice(&env, id, &admin);
+                purged.push_back(id);
+            }
+        }
+        purged
+    }
 }

@@ -375,6 +375,46 @@ pub fn invoice_partially_cloned(env: &Env, source_id: u64, new_id: u64, recipien
     );
 }
 
+/// Issue #927: Emitted when an archived invoice is restored.
+/// Topics: (split, restored, invoice_id)
+/// Data: (caller, ledger)
+pub fn invoice_restored(env: &Env, invoice_id: u64, caller: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("restored"), invoice_id),
+        (caller.clone(), env.ledger().sequence()),
+    );
+}
+
+/// Issue #927: Emitted when an archived invoice is purged by the cleanup policy.
+/// Topics: (split, arch_purg, invoice_id)
+/// Data: ledger
+pub fn invoice_archive_purged(env: &Env, invoice_id: u64) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("arch_purg"), invoice_id),
+        env.ledger().sequence(),
+    );
+}
+
+/// Issue #927: Emitted at the end of a scheduled archival sweep.
+/// Topics: (split, arch_swp)
+/// Data: (archived_count, cursor)
+pub fn archival_sweep_completed(env: &Env, archived_count: u32, cursor: u64) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("arch_swp")),
+        (archived_count, cursor),
+    );
+}
+
+/// Issue #927: Emitted when the archival policy changes.
+/// Topics: (split, arch_pol, admin)
+/// Data: (enabled, retention_ledgers)
+pub fn archival_policy_updated(env: &Env, admin: &Address, enabled: bool, retention_ledgers: u32) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("arch_pol"), admin.clone()),
+        (enabled, retention_ledgers),
+    );
+}
+
 /// Emitted when an invoice is paused.
 /// Topics: (split, paused, invoice_id)
 /// Data: (creator, reason, auto_resume_at)
