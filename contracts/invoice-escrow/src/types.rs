@@ -236,3 +236,40 @@ pub struct OracleReading {
     /// Ledger timestamp at which the evaluation happened.
     pub checked_at: u64,
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Scheduled release types
+// ──────────────────────────────────────────────────────────────────────
+
+/// Lifecycle state of a release schedule.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScheduleStatus {
+    /// Waiting for `release_at` / `unlock_ledger`; release is blocked until both pass.
+    Scheduled,
+    /// The invoice was released under this schedule.
+    Executed,
+    /// The creator cancelled the schedule; it no longer gates release.
+    Cancelled,
+}
+
+/// Delayed-release schedule attached to an escrow invoice.
+///
+/// Release is blocked until **both** the ledger timestamp reaches
+/// `release_at` and the ledger sequence reaches `unlock_ledger`. The ledger
+/// bound gives a manipulation-resistant minimum delay that does not depend
+/// on validator-reported close times.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReleaseSchedule {
+    /// Earliest Unix timestamp at which release is allowed.
+    pub release_at: u64,
+    /// Earliest ledger sequence at which release is allowed.
+    pub unlock_ledger: u32,
+    /// Ledger timestamp when the schedule was created.
+    pub scheduled_at: u64,
+    /// Ledger sequence when the schedule was created.
+    pub scheduled_ledger: u32,
+    /// Current schedule status.
+    pub status: ScheduleStatus,
+}

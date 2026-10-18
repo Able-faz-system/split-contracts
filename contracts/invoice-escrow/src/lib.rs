@@ -8,6 +8,7 @@
 //! - **Co-signer approval**: optional N-of-M sign-off gating release
 //! - **Oracle condition guards**: optional price-feed condition, with a
 //!   fallback oracle, that must hold before release
+//! - **Scheduled release**: optional time + ledger-count delay before release
 //!
 //! # Admin Transfer Flow
 //!
@@ -34,7 +35,8 @@ use soroban_sdk::{
 use oracle::PriceOracleClient;
 use types::{
     ApprovalStatus, BlacklistEntry, CosignerApproval, EscrowInvoice, EscrowReleased, EscrowStatus,
-    OracleCondition, OracleReading, OracleSource, PriceComparator, PriceData,
+    OracleCondition, OracleReading, OracleSource, PriceComparator, PriceData, ReleaseSchedule,
+    ScheduleStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -86,6 +88,11 @@ fn oracle_read_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("orc_read"), id)
 }
 
+/// Persistent storage: release schedule for an invoice.
+fn schedule_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("schedule"), id)
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -97,6 +104,13 @@ const APPEAL_WINDOW_LEDGERS: u32 = 360;
 /// Maximum number of co-signers on a single invoice. Bounds the linear
 /// membership scans performed on every vote.
 const MAX_COSIGNERS: u32 = 20;
+
+/// Maximum ledger delay for a release schedule (~1 year at 5s ledgers).
+const MAX_SCHEDULE_LEDGERS: u32 = 6_312_000;
+
+/// Extra ledgers of TTL kept on a scheduled invoice beyond its unlock
+/// ledger (~1 day), so the record is still live when it becomes due.
+const SCHEDULE_TTL_BUFFER_LEDGERS: u32 = 17_280;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -203,12 +217,42 @@ fn evaluate_oracle_condition(env: &Env, id: u64, cond: &OracleCondition) -> Resu
     })
 }
 
+fn get_schedule(env: &Env, id: u64) -> Option<ReleaseSchedule> {
+    env.storage().persistent().get(&schedule_key(id))
+}
+
+/// Persist a schedule and keep it (and its invoice) alive at least until
+/// the unlock ledger plus a buffer, capped at the network's maximum TTL.
+fn save_schedule(env: &Env, id: u64, schedule: &ReleaseSchedule) {
+    let storage = env.storage().persistent();
+    storage.set(&schedule_key(id), schedule);
+
+    let ledgers_left = schedule
+        .unlock_ledger
+        .saturating_sub(env.ledger().sequence());
+    let extend_to = ledgers_left
+        .saturating_add(SCHEDULE_TTL_BUFFER_LEDGERS)
+        .min(env.storage().max_ttl());
+    storage.extend_ttl(&schedule_key(id), extend_to, extend_to);
+    storage.extend_ttl(&invoice_key(id), extend_to, extend_to);
+}
+
 /// Check every release gate configured on the invoice. Returns `Ok(())`
 /// when the invoice may be released now.
 ///
-/// Gates are checked cheapest-first: co-signer approval, then the oracle
-/// condition (which requires a cross-contract call).
+/// Gates are checked cheapest-first: release schedule, co-signer approval,
+/// then the oracle condition (which requires a cross-contract call).
 fn check_release_gates(env: &Env, id: u64) -> Result<(), Error> {
+    if let Some(schedule) = get_schedule(env, id) {
+        if schedule.status == ScheduleStatus::Scheduled {
+            if env.ledger().timestamp() < schedule.release_at {
+                return Err(Error::ReleaseNotYetDue);
+            }
+            if env.ledger().sequence() < schedule.unlock_ledger {
+                return Err(Error::ScheduleLedgerNotReached);
+            }
+        }
+    }
     if let Some(approval) = get_approval(env, id) {
         match approval.status {
             ApprovalStatus::Approved => {}
@@ -270,6 +314,14 @@ fn execute_release(env: &Env, id: u64, invoice: &mut EscrowInvoice) -> (Address,
     let token_client = token::Client::new(env, &invoice.token);
     token_client.transfer(&env.current_contract_address(), &creator, &total);
     emit_released(env, id, total);
+
+    if let Some(mut schedule) = get_schedule(env, id) {
+        if schedule.status == ScheduleStatus::Scheduled {
+            schedule.status = ScheduleStatus::Executed;
+            env.storage().persistent().set(&schedule_key(id), &schedule);
+            emit_schedule_executed(env, id);
+        }
+    }
     (creator, total)
 }
 
@@ -390,6 +442,30 @@ fn emit_oracle_fallback(env: &Env, id: u64, primary_err: Error) {
     env.events().publish(
         (symbol_short!("escrow"), symbol_short!("orc_fback"), id),
         primary_err as u32,
+    );
+}
+
+/// Topics: `(escrow, sched_set, id)` — Data: `(release_at, unlock_ledger)`
+fn emit_schedule_set(env: &Env, id: u64, schedule: &ReleaseSchedule) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("sched_set"), id),
+        (schedule.release_at, schedule.unlock_ledger),
+    );
+}
+
+/// Topics: `(escrow, sched_cnl, id)` — Data: ledger sequence
+fn emit_schedule_cancelled(env: &Env, id: u64) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("sched_cnl"), id),
+        env.ledger().sequence(),
+    );
+}
+
+/// Topics: `(escrow, sched_exe, id)` — Data: `(timestamp, ledger)`
+fn emit_schedule_executed(env: &Env, id: u64) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("sched_exe"), id),
+        (env.ledger().timestamp(), env.ledger().sequence()),
     );
 }
 
@@ -692,6 +768,8 @@ impl InvoiceEscrowContract {
     /// * [`Error::InsufficientFunding`] — Not fully funded yet.
     /// * [`Error::ApprovalRequired`]   — Co-signer threshold not yet reached.
     /// * [`Error::ApprovalRejected`]   — Co-signers rejected the release.
+    /// * [`Error::ReleaseNotYetDue`]  — Scheduled release time not reached.
+    /// * [`Error::ScheduleLedgerNotReached`] — Scheduled ledger delay not elapsed.
     /// * [`Error::OracleConditionNotMet`] — Oracle price fails the condition.
     /// * [`Error::OracleUnavailable`] / [`Error::OracleStalePrice`] /
     ///   [`Error::OracleInvalidPrice`] — No usable oracle price.
@@ -1030,6 +1108,94 @@ impl InvoiceEscrowContract {
     }
 
     // -----------------------------------------------------------------------
+    // Scheduled release
+    // -----------------------------------------------------------------------
+
+    /// Delay the release of an invoice until a specific time and ledger.
+    ///
+    /// Release (including auto-release on full funding) is blocked until the
+    /// ledger timestamp is `>= release_at` **and** the ledger sequence is
+    /// `>= current_sequence + min_ledgers`. Only the creator may schedule,
+    /// and only while the invoice is open. Calling again replaces any
+    /// existing schedule.
+    ///
+    /// The schedule and invoice TTLs are extended so both entries remain
+    /// live until the schedule is due.
+    ///
+    /// # Arguments
+    /// * `invoice_id`  — Target invoice.
+    /// * `release_at`  — Unix timestamp; must be strictly in the future.
+    /// * `min_ledgers` — Minimum ledgers to wait (≤ `MAX_SCHEDULE_LEDGERS`).
+    ///
+    /// # Events
+    /// Emits `(escrow, sched_set, id)` with `(release_at, unlock_ledger)`.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`] — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]   — Invoice is no longer open.
+    /// * [`Error::InvalidSchedule`] — `release_at` not in the future or
+    ///   `min_ledgers` too large.
+    pub fn schedule_release(
+        env: Env,
+        invoice_id: u64,
+        release_at: u64,
+        min_ledgers: u32,
+    ) -> Result<ReleaseSchedule, Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        invoice.creator.require_auth();
+        if !is_open(&invoice) {
+            return Err(Error::InvalidStatus);
+        }
+
+        let now = env.ledger().timestamp();
+        let seq = env.ledger().sequence();
+        if release_at <= now || min_ledgers > MAX_SCHEDULE_LEDGERS {
+            return Err(Error::InvalidSchedule);
+        }
+        let unlock_ledger = seq.checked_add(min_ledgers).ok_or(Error::InvalidSchedule)?;
+
+        let schedule = ReleaseSchedule {
+            release_at,
+            unlock_ledger,
+            scheduled_at: now,
+            scheduled_ledger: seq,
+            status: ScheduleStatus::Scheduled,
+        };
+        save_schedule(&env, invoice_id, &schedule);
+        emit_schedule_set(&env, invoice_id, &schedule);
+        Ok(schedule)
+    }
+
+    /// Cancel an active release schedule so it no longer gates release.
+    ///
+    /// Only the creator may cancel, and only while the invoice is open.
+    ///
+    /// # Events
+    /// Emits `(escrow, sched_cnl, id)`.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`]  — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]    — Invoice is no longer open.
+    /// * [`Error::ScheduleNotFound`] — No active schedule.
+    pub fn cancel_release_schedule(env: Env, invoice_id: u64) -> Result<(), Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        invoice.creator.require_auth();
+        if !is_open(&invoice) {
+            return Err(Error::InvalidStatus);
+        }
+        let mut schedule = get_schedule(&env, invoice_id)
+            .filter(|s| s.status == ScheduleStatus::Scheduled)
+            .ok_or(Error::ScheduleNotFound)?;
+
+        schedule.status = ScheduleStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&schedule_key(invoice_id), &schedule);
+        emit_schedule_cancelled(&env, invoice_id);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Payer blacklist
     // -----------------------------------------------------------------------
 
@@ -1314,6 +1480,37 @@ impl InvoiceEscrowContract {
     /// (e.g. a deposit that completed funding), if any.
     pub fn get_last_oracle_reading(env: Env, invoice_id: u64) -> Option<OracleReading> {
         env.storage().persistent().get(&oracle_read_key(invoice_id))
+    }
+
+    /// Return the release schedule for an invoice, if any.
+    pub fn get_release_schedule(env: Env, invoice_id: u64) -> Option<ReleaseSchedule> {
+        get_schedule(&env, invoice_id)
+    }
+
+    /// Return `true` when the invoice has no active schedule or its schedule
+    /// is due (both the time and ledger bounds have passed).
+    pub fn is_release_due(env: Env, invoice_id: u64) -> bool {
+        get_schedule(&env, invoice_id).map_or(true, |s| {
+            s.status != ScheduleStatus::Scheduled
+                || (env.ledger().timestamp() >= s.release_at
+                    && env.ledger().sequence() >= s.unlock_ledger)
+        })
+    }
+
+    /// Seconds remaining until the scheduled release time (`0` when due or
+    /// when there is no active schedule).
+    pub fn seconds_until_release(env: Env, invoice_id: u64) -> u64 {
+        get_schedule(&env, invoice_id)
+            .filter(|s| s.status == ScheduleStatus::Scheduled)
+            .map_or(0, |s| s.release_at.saturating_sub(env.ledger().timestamp()))
+    }
+
+    /// Ledgers remaining until the scheduled unlock ledger (`0` when reached
+    /// or when there is no active schedule).
+    pub fn ledgers_until_release(env: Env, invoice_id: u64) -> u32 {
+        get_schedule(&env, invoice_id)
+            .filter(|s| s.status == ScheduleStatus::Scheduled)
+            .map_or(0, |s| s.unlock_ledger.saturating_sub(env.ledger().sequence()))
     }
 
     /// Return `true` if the payer is blacklisted with a finalised and upheld entry.

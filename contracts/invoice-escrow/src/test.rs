@@ -1496,3 +1496,274 @@ mod oracle_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Scheduled release (#916)
+// ---------------------------------------------------------------------------
+
+mod schedule_tests {
+    use super::*;
+    use crate::types::ScheduleStatus;
+    use soroban_sdk::testutils::storage::Persistent as _;
+
+    struct Ctx {
+        env: Env,
+        contract_id: Address,
+        payer: Address,
+        id: u64,
+    }
+
+    impl Ctx {
+        fn client(&self) -> InvoiceEscrowContractClient<'_> {
+            InvoiceEscrowContractClient::new(&self.env, &self.contract_id)
+        }
+
+        fn advance(&self, secs: u64, ledgers: u32) {
+            self.env.ledger().with_mut(|li| {
+                li.timestamp += secs;
+                li.sequence_number += ledgers;
+            });
+        }
+    }
+
+    const NOW: u64 = 1_000_000;
+
+    fn setup_invoice() -> Ctx {
+        let (env, contract_id) = setup();
+        env.ledger().with_mut(|li| {
+            li.timestamp = NOW;
+            li.sequence_number = 100;
+        });
+        let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = create_token(&env, &token_admin);
+        mint(&env, &token, &token_admin, &payer, 10_000);
+
+        client.initialize(&admin);
+        let id = client.create_invoice(&creator, &token, &1_000, &(NOW + 100_000));
+        Ctx { env, contract_id, payer, id }
+    }
+
+    #[test]
+    fn test_schedule_release_records_schedule() {
+        let ctx = setup_invoice();
+        let client = ctx.client();
+        let schedule = client.schedule_release(&ctx.id, &(NOW + 3_600), &720);
+
+        assert_eq!(schedule.release_at, NOW + 3_600);
+        assert_eq!(schedule.unlock_ledger, 820);
+        assert_eq!(schedule.scheduled_at, NOW);
+        assert_eq!(schedule.scheduled_ledger, 100);
+        assert_eq!(schedule.status, ScheduleStatus::Scheduled);
+        assert_eq!(client.get_release_schedule(&ctx.id), Some(schedule));
+    }
+
+    #[test]
+    fn test_schedule_release_invalid_inputs() {
+        let ctx = setup_invoice();
+        let client = ctx.client();
+        assert_eq!(
+            client.try_schedule_release(&ctx.id, &NOW, &0),
+            Err(Ok(Error::InvalidSchedule))
+        );
+        assert_eq!(
+            client.try_schedule_release(&ctx.id, &(NOW - 1), &0),
+            Err(Ok(Error::InvalidSchedule))
+        );
+        assert_eq!(
+            client.try_schedule_release(&ctx.id, &(NOW + 1), &6_312_001),
+            Err(Ok(Error::InvalidSchedule))
+        );
+        assert_eq!(
+            client.try_schedule_release(&99, &(NOW + 1), &0),
+            Err(Ok(Error::InvoiceNotFound))
+        );
+    }
+
+    #[test]
+    fn test_schedule_blocks_auto_release_until_due() {
+        let ctx = setup_invoice();
+        let client = ctx.client();
+        client.schedule_release(&ctx.id, &(NOW + 3_600), &10);
+
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Active);
+        assert_eq!(client.try_release(&ctx.id), Err(Ok(Error::ReleaseNotYetDue)));
+        assert!(!client.is_release_due(&ctx.id));
+
+        ctx.advance(3_600, 10);
+        assert!(client.is_release_due(&ctx.id));
+        client.release(&ctx.id);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Released);
+        assert_eq!(
+            client.get_release_schedule(&ctx.id).unwrap().status,
+            ScheduleStatus::Executed
+        );
+    }
+
+    #[test]
+    fn test_time_reached_but_ledgers_not_elapsed() {
+        let ctx = setup_invoice();
+        let client = ctx.client();
+        client.schedule_release(&ctx.id, &(NOW + 60), &100);
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+
+        // Timestamp jumps ahead faster than ledgers close.
+        ctx.advance(10_000, 99);
+        assert_eq!(client.try_release(&ctx.id), Err(Ok(Error::ScheduleLedgerNotReached)));
+        assert_eq!(client.ledgers_until_release(&ctx.id), 1);
+        assert_eq!(client.seconds_until_release(&ctx.id), 0);
+
+        ctx.advance(5, 1);
+        client.release(&ctx.id);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Released);
+    }
+
+    #[test]
+    fn test_ledgers_elapsed_but_time_not_reached() {
+        let ctx = setup_invoice();
+        let client = ctx.client();
+        client.schedule_release(&ctx.id, &(NOW + 3_600), &10);
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+
+        ctx.advance(3_599, 1_000);
+        assert_eq!(client.try_release(&ctx.id), Err(Ok(Error::ReleaseNotYetDue)));
+        assert_eq!(client.seconds_until_release(&ctx.id), 1);
+        assert_eq!(client.ledgers_until_release(&ctx.id), 0);
+    }
+
+    #[test]
+    fn test_release_exactly_at_boundaries() {
+        let ctx = setup_invoice();
+        let client = ctx.client();
+        client.schedule_release(&ctx.id, &(NOW + 500), &50);
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+
+        ctx.advance(500, 50);
+        assert_eq!(client.seconds_until_release(&ctx.id), 0);
+        assert_eq!(client.ledgers_until_release(&ctx.id), 0);
+        client.release(&ctx.id);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Released);
+    }
+
+    #[test]
+    fn test_countdown_views() {
+        let ctx = setup_invoice();
+        let client = ctx.client();
+        client.schedule_release(&ctx.id, &(NOW + 1_000), &200);
+
+        assert_eq!(client.seconds_until_release(&ctx.id), 1_000);
+        assert_eq!(client.ledgers_until_release(&ctx.id), 200);
+        ctx.advance(250, 50);
+        assert_eq!(client.seconds_until_release(&ctx.id), 750);
+        assert_eq!(client.ledgers_until_release(&ctx.id), 150);
+    }
+
+    #[test]
+    fn test_due_schedule_allows_auto_release_on_deposit() {
+        let ctx = setup_invoice();
+        let client = ctx.client();
+        client.schedule_release(&ctx.id, &(NOW + 10), &1);
+        ctx.advance(10, 1);
+
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Released);
+        assert_eq!(
+            client.get_release_schedule(&ctx.id).unwrap().status,
+            ScheduleStatus::Executed
+        );
+    }
+
+    #[test]
+    fn test_reschedule_replaces_schedule() {
+        let ctx = setup_invoice();
+        let client = ctx.client();
+        client.schedule_release(&ctx.id, &(NOW + 10_000), &1_000);
+        client.schedule_release(&ctx.id, &(NOW + 10), &0);
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+
+        ctx.advance(10, 0);
+        client.release(&ctx.id);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Released);
+    }
+
+    #[test]
+    fn test_cancel_schedule_unblocks_release() {
+        let ctx = setup_invoice();
+        let client = ctx.client();
+        client.schedule_release(&ctx.id, &(NOW + 10_000), &1_000);
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+        assert_eq!(client.try_release(&ctx.id), Err(Ok(Error::ReleaseNotYetDue)));
+
+        client.cancel_release_schedule(&ctx.id);
+        assert_eq!(
+            client.get_release_schedule(&ctx.id).unwrap().status,
+            ScheduleStatus::Cancelled
+        );
+        assert!(client.is_release_due(&ctx.id));
+        assert_eq!(client.seconds_until_release(&ctx.id), 0);
+
+        client.release(&ctx.id);
+        assert_eq!(client.get_invoice(&ctx.id).status, EscrowStatus::Released);
+        // Cancelled schedule stays cancelled rather than becoming executed.
+        assert_eq!(
+            client.get_release_schedule(&ctx.id).unwrap().status,
+            ScheduleStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn test_cancel_without_schedule_fails() {
+        let ctx = setup_invoice();
+        let client = ctx.client();
+        assert_eq!(
+            client.try_cancel_release_schedule(&ctx.id),
+            Err(Ok(Error::ScheduleNotFound))
+        );
+        client.schedule_release(&ctx.id, &(NOW + 10), &0);
+        client.cancel_release_schedule(&ctx.id);
+        assert_eq!(
+            client.try_cancel_release_schedule(&ctx.id),
+            Err(Ok(Error::ScheduleNotFound))
+        );
+    }
+
+    #[test]
+    fn test_schedule_blocked_after_release() {
+        let ctx = setup_invoice();
+        let client = ctx.client();
+        client.deposit(&ctx.payer, &ctx.id, &1_000);
+        assert_eq!(
+            client.try_schedule_release(&ctx.id, &(NOW + 10), &0),
+            Err(Ok(Error::InvalidStatus))
+        );
+    }
+
+    #[test]
+    fn test_schedule_persists_until_due() {
+        let ctx = setup_invoice();
+        let client = ctx.client();
+        client.schedule_release(&ctx.id, &(NOW + 10), &100_000);
+
+        let ttl = ctx.env.as_contract(&ctx.contract_id, || {
+            ctx.env
+                .storage()
+                .persistent()
+                .get_ttl(&(symbol_short!("schedule"), ctx.id))
+        });
+        assert!(ttl >= 100_000, "schedule TTL {} shorter than delay", ttl);
+    }
+
+    #[test]
+    fn test_no_schedule_views() {
+        let ctx = setup_invoice();
+        let client = ctx.client();
+        assert_eq!(client.get_release_schedule(&ctx.id), None);
+        assert!(client.is_release_due(&ctx.id));
+        assert_eq!(client.seconds_until_release(&ctx.id), 0);
+        assert_eq!(client.ledgers_until_release(&ctx.id), 0);
+    }
+}

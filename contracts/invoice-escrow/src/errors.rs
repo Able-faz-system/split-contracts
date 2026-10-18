@@ -76,4 +76,13 @@ pub enum Error {
     OracleConditionNotMet = 32,
     /// No oracle condition is configured for this invoice.
     NoOracleCondition = 33,
+    /// Schedule is malformed: `release_at` not in the future, or the ledger
+    /// delay exceeds the maximum / overflows.
+    InvalidSchedule = 34,
+    /// The scheduled release time has not been reached yet.
+    ReleaseNotYetDue = 35,
+    /// The scheduled minimum ledger count has not elapsed yet.
+    ScheduleLedgerNotReached = 36,
+    /// No active release schedule exists for this invoice.
+    ScheduleNotFound = 37,
 }
