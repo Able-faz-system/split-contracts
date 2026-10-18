@@ -59,6 +59,7 @@ mod validation;
 mod calc;
 mod stats;
 pub mod security_audit;
+pub mod payment_tracking;
 
 #[cfg(test)]
 mod test;
@@ -15915,6 +15916,65 @@ impl SplitContract {
     /// Return the security event log, oldest entry first.
     pub fn get_security_events(env: Env) -> Vec<security_audit::SecurityEvent> {
         security_audit::get_security_events(&env)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #911: Partial invoice payment tracking
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl SplitContract {
+    /// Initialise per-recipient partial payment tracking for an invoice with
+    /// the given milestone thresholds (ascending basis points). Creator only.
+    pub fn init_payment_tracking(
+        env: Env,
+        creator: Address,
+        invoice_id: u64,
+        milestone_bps: Vec<u32>,
+    ) -> payment_tracking::PaymentTracker {
+        require_not_paused(&env);
+        payment_tracking::init_tracking(&env, &creator, invoice_id, milestone_bps)
+    }
+
+    /// Record a partial payment to `recipient`. Creator only.
+    pub fn record_partial_payment(
+        env: Env,
+        creator: Address,
+        invoice_id: u64,
+        recipient: Address,
+        amount: i128,
+    ) -> payment_tracking::PaymentTracker {
+        require_not_paused(&env);
+        payment_tracking::record_payment(&env, &creator, invoice_id, &recipient, amount)
+    }
+
+    /// Settle a reached milestone. Milestones settle strictly in order. Creator only.
+    pub fn settle_payment_milestone(
+        env: Env,
+        creator: Address,
+        invoice_id: u64,
+        milestone_index: u32,
+    ) -> payment_tracking::PaymentTracker {
+        require_not_paused(&env);
+        payment_tracking::settle_milestone(&env, &creator, invoice_id, milestone_index)
+    }
+
+    /// Return the partial payment tracker for an invoice, if initialised.
+    pub fn get_payment_tracker(
+        env: Env,
+        invoice_id: u64,
+    ) -> Option<payment_tracking::PaymentTracker> {
+        payment_tracking::get_tracker(&env, invoice_id)
+    }
+
+    /// Return the paid-flag bitmask (bit `i` set = recipient `i` fully paid).
+    pub fn get_recipient_paid_flags(env: Env, invoice_id: u64) -> u64 {
+        payment_tracking::get_paid_flags(&env, invoice_id)
+    }
+
+    /// Whether recipient at `index` has been fully paid.
+    pub fn is_recipient_paid(env: Env, invoice_id: u64, index: u32) -> bool {
+        payment_tracking::is_recipient_paid(&env, invoice_id, index)
     }
 }
 

@@ -8813,3 +8813,185 @@ fn test_892_severity_weights_are_monotonic() {
     assert!(AuditSeverity::Medium.weight() < AuditSeverity::High.weight());
     assert!(AuditSeverity::High.weight() < AuditSeverity::Critical.weight());
 }
+
+// ---------------------------------------------------------------------------
+// Issue #911: Partial invoice payment tracking
+// ---------------------------------------------------------------------------
+
+fn setup_911() -> (Env, Address, Address, Address, Address, u64) {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+    let creator = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(600_i128);
+    amounts.push_back(400_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000, &default_options(&env));
+    (env, contract_id, creator, r1, r2, id)
+}
+
+fn milestones_911(env: &Env) -> Vec<u32> {
+    let mut m = Vec::new(env);
+    m.push_back(5_000u32);
+    m.push_back(10_000u32);
+    m
+}
+
+#[test]
+fn test_911_init_tracking_creates_structure() {
+    let (env, contract_id, creator, r1, r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+
+    let t = c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    assert_eq!(t.total_due, 1_000);
+    assert_eq!(t.total_paid, 0);
+    assert_eq!(t.recipients.len(), 2);
+    assert_eq!(t.recipients.get(0).unwrap().recipient, r1);
+    assert_eq!(t.recipients.get(1).unwrap().recipient, r2);
+    assert_eq!(t.milestones.len(), 2);
+    assert_eq!(
+        t.milestones.get(0).unwrap().state,
+        payment_tracking::MilestoneState::Pending
+    );
+    assert_eq!(c.get_recipient_paid_flags(&id), 0);
+    assert_eq!(c.get_payment_tracker(&id), Some(t));
+}
+
+#[test]
+fn test_911_partial_payments_set_paid_flags_and_milestones() {
+    let (env, contract_id, creator, r1, r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+
+    // 300 of 1000 paid: below the 50% milestone.
+    let t = c.record_partial_payment(&creator, &id, &r1, &300);
+    assert_eq!(t.total_paid, 300);
+    assert!(!c.is_recipient_paid(&id, &0));
+    assert_eq!(
+        t.milestones.get(0).unwrap().state,
+        payment_tracking::MilestoneState::Pending
+    );
+
+    // r1 fully paid (600) → 60%: first milestone reached.
+    let t = c.record_partial_payment(&creator, &id, &r1, &300);
+    assert!(c.is_recipient_paid(&id, &0));
+    assert!(!c.is_recipient_paid(&id, &1));
+    assert_eq!(c.get_recipient_paid_flags(&id), 0b01);
+    assert_eq!(
+        t.milestones.get(0).unwrap().state,
+        payment_tracking::MilestoneState::Reached
+    );
+
+    // r2 fully paid → 100%: second milestone reached.
+    let t = c.record_partial_payment(&creator, &id, &r2, &400);
+    assert_eq!(c.get_recipient_paid_flags(&id), 0b11);
+    assert_eq!(t.total_paid, 1_000);
+    assert_eq!(
+        t.milestones.get(1).unwrap().state,
+        payment_tracking::MilestoneState::Reached
+    );
+}
+
+#[test]
+fn test_911_settle_milestones_in_order() {
+    let (env, contract_id, creator, r1, r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.record_partial_payment(&creator, &id, &r1, &600);
+    c.record_partial_payment(&creator, &id, &r2, &400);
+
+    let t = c.settle_payment_milestone(&creator, &id, &0);
+    assert_eq!(
+        t.milestones.get(0).unwrap().state,
+        payment_tracking::MilestoneState::Settled
+    );
+    let t = c.settle_payment_milestone(&creator, &id, &1);
+    assert_eq!(
+        t.milestones.get(1).unwrap().state,
+        payment_tracking::MilestoneState::Settled
+    );
+}
+
+#[test]
+#[should_panic(expected = "previous milestone not settled")]
+fn test_911_settle_out_of_order_panics() {
+    let (env, contract_id, creator, r1, r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.record_partial_payment(&creator, &id, &r1, &600);
+    c.record_partial_payment(&creator, &id, &r2, &400);
+    c.settle_payment_milestone(&creator, &id, &1);
+}
+
+#[test]
+#[should_panic(expected = "milestone not reached")]
+fn test_911_settle_unreached_milestone_panics() {
+    let (env, contract_id, creator, _r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.settle_payment_milestone(&creator, &id, &0);
+}
+
+#[test]
+#[should_panic(expected = "payment exceeds recipient amount due")]
+fn test_911_overpayment_rejected() {
+    let (env, contract_id, creator, r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.record_partial_payment(&creator, &id, &r1, &601);
+}
+
+#[test]
+fn test_911_failed_update_leaves_state_unchanged() {
+    let (env, contract_id, creator, r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.record_partial_payment(&creator, &id, &r1, &100);
+    let before = c.get_payment_tracker(&id);
+
+    let result = c.try_record_partial_payment(&creator, &id, &r1, &10_000);
+    assert!(result.is_err());
+    assert_eq!(c.get_payment_tracker(&id), before);
+}
+
+#[test]
+#[should_panic(expected = "only the creator can record payments")]
+fn test_911_non_creator_cannot_record() {
+    let (env, contract_id, creator, r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.record_partial_payment(&Address::generate(&env), &id, &r1, &100);
+}
+
+#[test]
+#[should_panic(expected = "milestones must be strictly ascending")]
+fn test_911_invalid_milestones_rejected() {
+    let (env, contract_id, creator, _r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    let mut m = Vec::new(&env);
+    m.push_back(5_000u32);
+    m.push_back(5_000u32);
+    c.init_payment_tracking(&creator, &id, &m);
+}
+
+#[test]
+#[should_panic(expected = "payment tracking already initialised")]
+fn test_911_double_init_rejected() {
+    let (env, contract_id, creator, _r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+}
+
+#[test]
+fn test_911_paid_bps_helper() {
+    assert_eq!(payment_tracking::paid_bps(0, 1_000), 0);
+    assert_eq!(payment_tracking::paid_bps(500, 1_000), 5_000);
+    assert_eq!(payment_tracking::paid_bps(2_000, 1_000), 10_000);
+    assert_eq!(payment_tracking::paid_bps(10, 0), 0);
+}

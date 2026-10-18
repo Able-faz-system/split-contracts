@@ -1973,6 +1973,50 @@ pub fn security_event_logged(
 }
 
 // ---------------------------------------------------------------------------
+// Issue #911: Partial invoice payment tracking events
+// ---------------------------------------------------------------------------
+
+/// Emitted when partial payment tracking is initialised for an invoice.
+/// Topics: (split, pt_init, invoice_id)
+/// Data: (total_due, milestone_count, event_seq)
+pub fn payment_tracking_initialised(env: &Env, invoice_id: u64, total_due: i128, milestone_count: u32) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pt_init"), invoice_id),
+        (total_due, milestone_count, event_seq),
+    );
+}
+
+/// Emitted when a partial payment to a recipient is recorded.
+/// Topics: (split, pt_pay, invoice_id)
+/// Data: (recipient, amount, total_paid_to_recipient, fully_paid, event_seq)
+pub fn partial_payment_recorded(
+    env: &Env,
+    invoice_id: u64,
+    recipient: &Address,
+    amount: i128,
+    recipient_paid: i128,
+    fully_paid: bool,
+) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pt_pay"), invoice_id),
+        (recipient.clone(), amount, recipient_paid, fully_paid, event_seq),
+    );
+}
+
+/// Emitted when a payment milestone changes state (1 = Reached, 2 = Settled).
+/// Topics: (split, pt_mile, invoice_id)
+/// Data: (threshold_bps, state, event_seq)
+pub fn payment_milestone_state(env: &Env, invoice_id: u64, threshold_bps: u32, state: u32) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pt_mile"), invoice_id),
+        (threshold_bps, state, event_seq),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests for the per-invoice event sequence counter (issue #708)
 // ---------------------------------------------------------------------------
 
