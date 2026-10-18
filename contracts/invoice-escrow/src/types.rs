@@ -273,3 +273,41 @@ pub struct ReleaseSchedule {
     /// Current schedule status.
     pub status: ScheduleStatus,
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Refund grace period types
+// ──────────────────────────────────────────────────────────────────────
+
+/// Per-invoice refund grace configuration.
+///
+/// After an invoice's deadline passes, refunds stay blocked for
+/// `grace_secs + extension_secs` more seconds, unless the admin waives the
+/// grace period. This gives creators, co-signers and oracles time to clear
+/// release gates before payers are refunded.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RefundGrace {
+    /// Base grace period in seconds (snapshotted from the default or set by the creator).
+    pub grace_secs: u64,
+    /// Additional seconds granted by admin extensions.
+    pub extension_secs: u64,
+    /// `true` once the admin waives the grace period; refunds are then
+    /// allowed as soon as the deadline passes.
+    pub waived: bool,
+}
+
+/// Where an invoice is in its refund grace timeline.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RefundGraceStatus {
+    /// No grace period applies; refunds open at the deadline.
+    NoGrace,
+    /// Deadline not yet reached; the grace timer has not started.
+    NotStarted,
+    /// Deadline passed and the grace timer is counting down.
+    Active,
+    /// Grace period is over; refunds can be processed.
+    Elapsed,
+    /// Admin waived the grace period; refunds can be processed after the deadline.
+    Waived,
+}

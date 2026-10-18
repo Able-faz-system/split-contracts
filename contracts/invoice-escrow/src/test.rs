@@ -1767,3 +1767,323 @@ mod schedule_tests {
         assert_eq!(client.ledgers_until_release(&ctx.id), 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Refund grace period (#917)
+// ---------------------------------------------------------------------------
+
+mod refund_grace_tests {
+    use super::*;
+    use crate::types::RefundGraceStatus;
+    use soroban_sdk::vec;
+
+    struct Ctx {
+        env: Env,
+        contract_id: Address,
+        payer: Address,
+        token: Address,
+        creator: Address,
+    }
+
+    impl Ctx {
+        fn client(&self) -> InvoiceEscrowContractClient<'_> {
+            InvoiceEscrowContractClient::new(&self.env, &self.contract_id)
+        }
+
+        fn set_time(&self, ts: u64) {
+            self.env.ledger().with_mut(|li| li.timestamp = ts);
+        }
+
+        fn create(&self) -> u64 {
+            self.client()
+                .create_invoice(&self.creator, &self.token, &1_000, &DEADLINE)
+        }
+    }
+
+    const NOW: u64 = 1_000_000;
+    const DEADLINE: u64 = NOW + 1_000;
+    const GRACE: u64 = 3_600;
+
+    fn setup_ctx() -> Ctx {
+        let (env, contract_id) = setup();
+        env.ledger().with_mut(|li| li.timestamp = NOW);
+        let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = create_token(&env, &token_admin);
+        mint(&env, &token, &token_admin, &payer, 10_000);
+        client.initialize(&admin);
+        Ctx { env, contract_id, payer, token, creator }
+    }
+
+    #[test]
+    fn test_default_grace_config() {
+        let ctx = setup_ctx();
+        let client = ctx.client();
+        assert_eq!(client.get_default_refund_grace(), 0);
+        client.set_default_refund_grace(&GRACE);
+        assert_eq!(client.get_default_refund_grace(), GRACE);
+
+        assert_eq!(
+            client.try_set_default_refund_grace(&(30 * 24 * 60 * 60 + 1)),
+            Err(Ok(Error::InvalidGracePeriod))
+        );
+    }
+
+    #[test]
+    fn test_default_grace_snapshotted_at_creation() {
+        let ctx = setup_ctx();
+        let client = ctx.client();
+        let without = ctx.create();
+        client.set_default_refund_grace(&GRACE);
+        let with = ctx.create();
+        client.set_default_refund_grace(&10);
+
+        assert_eq!(client.get_refund_grace(&without), None);
+        assert_eq!(client.get_refund_grace(&with).unwrap().grace_secs, GRACE);
+        assert_eq!(client.refund_available_after(&without), DEADLINE);
+        assert_eq!(client.refund_available_after(&with), DEADLINE + GRACE);
+    }
+
+    #[test]
+    fn test_no_grace_refund_at_deadline_unchanged() {
+        let ctx = setup_ctx();
+        let client = ctx.client();
+        let id = ctx.create();
+        client.deposit(&ctx.payer, &id, &400);
+        assert_eq!(client.get_refund_grace_status(&id), RefundGraceStatus::NoGrace);
+
+        ctx.set_time(DEADLINE + 1);
+        client.refund(&id, &vec![&ctx.env, ctx.payer.clone()]);
+        assert_eq!(client.get_invoice(&id).status, EscrowStatus::Refunded);
+    }
+
+    #[test]
+    fn test_grace_blocks_refund_then_allows_after_elapsed() {
+        let ctx = setup_ctx();
+        let client = ctx.client();
+        client.set_default_refund_grace(&GRACE);
+        let id = ctx.create();
+        client.deposit(&ctx.payer, &id, &400);
+        let payers = vec![&ctx.env, ctx.payer.clone()];
+
+        assert_eq!(client.get_refund_grace_status(&id), RefundGraceStatus::NotStarted);
+        assert_eq!(client.try_refund(&id, &payers), Err(Ok(Error::DeadlineNotPassed)));
+
+        ctx.set_time(DEADLINE + 1);
+        assert_eq!(client.get_refund_grace_status(&id), RefundGraceStatus::Active);
+        assert_eq!(client.try_refund(&id, &payers), Err(Ok(Error::RefundGraceActive)));
+
+        // Boundary: refunds open strictly after deadline + grace.
+        ctx.set_time(DEADLINE + GRACE);
+        assert_eq!(client.try_refund(&id, &payers), Err(Ok(Error::RefundGraceActive)));
+
+        ctx.set_time(DEADLINE + GRACE + 1);
+        assert_eq!(client.get_refund_grace_status(&id), RefundGraceStatus::Elapsed);
+        client.refund(&id, &payers);
+        assert_eq!(client.get_invoice(&id).status, EscrowStatus::Refunded);
+        let tok = token::Client::new(&ctx.env, &ctx.token);
+        assert_eq!(tok.balance(&ctx.payer), 10_000);
+    }
+
+    #[test]
+    fn test_timer_counts_down() {
+        let ctx = setup_ctx();
+        let client = ctx.client();
+        client.set_default_refund_grace(&GRACE);
+        let id = ctx.create();
+
+        // Before the deadline the full window is reported.
+        assert_eq!(client.refund_grace_remaining(&id), GRACE);
+        ctx.set_time(DEADLINE);
+        assert_eq!(client.refund_grace_remaining(&id), GRACE);
+        ctx.set_time(DEADLINE + 600);
+        assert_eq!(client.refund_grace_remaining(&id), GRACE - 600);
+        ctx.set_time(DEADLINE + GRACE);
+        assert_eq!(client.refund_grace_remaining(&id), 0);
+        ctx.set_time(DEADLINE + GRACE + 100);
+        assert_eq!(client.refund_grace_remaining(&id), 0);
+    }
+
+    #[test]
+    fn test_creator_sets_invoice_grace_before_deposits() {
+        let ctx = setup_ctx();
+        let client = ctx.client();
+        client.set_default_refund_grace(&GRACE);
+        let id = ctx.create();
+
+        client.set_refund_grace(&id, &60);
+        assert_eq!(client.refund_available_after(&id), DEADLINE + 60);
+
+        client.set_refund_grace(&id, &0);
+        assert_eq!(client.get_refund_grace_status(&id), RefundGraceStatus::NoGrace);
+
+        assert_eq!(
+            client.try_set_refund_grace(&id, &(30 * 24 * 60 * 60 + 1)),
+            Err(Ok(Error::InvalidGracePeriod))
+        );
+
+        client.deposit(&ctx.payer, &id, &100);
+        assert_eq!(client.try_set_refund_grace(&id, &60), Err(Ok(Error::InvalidStatus)));
+    }
+
+    #[test]
+    fn test_admin_extend_grace() {
+        let ctx = setup_ctx();
+        let client = ctx.client();
+        client.set_default_refund_grace(&GRACE);
+        let id = ctx.create();
+        client.deposit(&ctx.payer, &id, &400);
+        let payers = vec![&ctx.env, ctx.payer.clone()];
+
+        ctx.set_time(DEADLINE + 10);
+        client.extend_refund_grace(&id, &1_000);
+        assert_eq!(client.get_refund_grace(&id).unwrap().extension_secs, 1_000);
+        assert_eq!(client.refund_available_after(&id), DEADLINE + GRACE + 1_000);
+
+        ctx.set_time(DEADLINE + GRACE + 1);
+        assert_eq!(client.try_refund(&id, &payers), Err(Ok(Error::RefundGraceActive)));
+        ctx.set_time(DEADLINE + GRACE + 1_001);
+        client.refund(&id, &payers);
+        assert_eq!(client.get_invoice(&id).status, EscrowStatus::Refunded);
+    }
+
+    #[test]
+    fn test_extend_grace_limits() {
+        let ctx = setup_ctx();
+        let client = ctx.client();
+        client.set_default_refund_grace(&GRACE);
+        let id = ctx.create();
+
+        assert_eq!(client.try_extend_refund_grace(&id, &0), Err(Ok(Error::InvalidGracePeriod)));
+        assert_eq!(
+            client.try_extend_refund_grace(&id, &(30 * 24 * 60 * 60)),
+            Err(Ok(Error::InvalidGracePeriod))
+        );
+        assert_eq!(
+            client.try_extend_refund_grace(&id, &u64::MAX),
+            Err(Ok(Error::InvalidGracePeriod))
+        );
+
+        ctx.set_time(DEADLINE + GRACE + 1);
+        assert_eq!(
+            client.try_extend_refund_grace(&id, &10),
+            Err(Ok(Error::RefundGraceElapsed))
+        );
+    }
+
+    #[test]
+    fn test_extend_creates_grace_when_none_before_deadline() {
+        let ctx = setup_ctx();
+        let client = ctx.client();
+        let id = ctx.create();
+
+        client.extend_refund_grace(&id, &500);
+        assert_eq!(client.refund_available_after(&id), DEADLINE + 500);
+
+        let other = ctx.create();
+        ctx.set_time(DEADLINE + 1);
+        assert_eq!(
+            client.try_extend_refund_grace(&other, &500),
+            Err(Ok(Error::RefundGraceElapsed))
+        );
+    }
+
+    #[test]
+    fn test_admin_waive_allows_immediate_refund() {
+        let ctx = setup_ctx();
+        let client = ctx.client();
+        client.set_default_refund_grace(&GRACE);
+        let id = ctx.create();
+        client.deposit(&ctx.payer, &id, &400);
+        let payers = vec![&ctx.env, ctx.payer.clone()];
+
+        ctx.set_time(DEADLINE + 1);
+        assert_eq!(client.try_refund(&id, &payers), Err(Ok(Error::RefundGraceActive)));
+
+        client.waive_refund_grace(&id);
+        assert_eq!(client.get_refund_grace_status(&id), RefundGraceStatus::Waived);
+        assert_eq!(client.refund_grace_remaining(&id), 0);
+        assert_eq!(client.refund_available_after(&id), DEADLINE);
+
+        client.refund(&id, &payers);
+        assert_eq!(client.get_invoice(&id).status, EscrowStatus::Refunded);
+    }
+
+    #[test]
+    fn test_waive_before_deadline_still_requires_deadline() {
+        let ctx = setup_ctx();
+        let client = ctx.client();
+        client.set_default_refund_grace(&GRACE);
+        let id = ctx.create();
+        client.deposit(&ctx.payer, &id, &400);
+
+        client.waive_refund_grace(&id);
+        assert_eq!(
+            client.try_refund(&id, &vec![&ctx.env, ctx.payer.clone()]),
+            Err(Ok(Error::DeadlineNotPassed))
+        );
+    }
+
+    #[test]
+    fn test_waive_rejected_when_nothing_to_waive() {
+        let ctx = setup_ctx();
+        let client = ctx.client();
+        let no_grace = ctx.create();
+        assert_eq!(
+            client.try_waive_refund_grace(&no_grace),
+            Err(Ok(Error::RefundGraceElapsed))
+        );
+
+        client.set_default_refund_grace(&GRACE);
+        let id = ctx.create();
+        client.waive_refund_grace(&id);
+        assert_eq!(client.try_waive_refund_grace(&id), Err(Ok(Error::RefundGraceElapsed)));
+        assert_eq!(
+            client.try_extend_refund_grace(&id, &10),
+            Err(Ok(Error::RefundGraceElapsed))
+        );
+    }
+
+    #[test]
+    fn test_overrides_blocked_on_closed_invoice() {
+        let ctx = setup_ctx();
+        let client = ctx.client();
+        client.set_default_refund_grace(&GRACE);
+        let id = ctx.create();
+        client.deposit(&ctx.payer, &id, &1_000);
+        assert_eq!(client.get_invoice(&id).status, EscrowStatus::Released);
+
+        assert_eq!(client.try_extend_refund_grace(&id, &10), Err(Ok(Error::InvalidStatus)));
+        assert_eq!(client.try_waive_refund_grace(&id), Err(Ok(Error::InvalidStatus)));
+    }
+
+    #[test]
+    fn test_release_still_possible_during_grace() {
+        let ctx = setup_ctx();
+        let client = ctx.client();
+        client.set_default_refund_grace(&GRACE);
+        let id = ctx.create();
+
+        // Funding completes but a schedule delays release past the deadline.
+        client.schedule_release(&id, &(DEADLINE + 100), &0);
+        client.deposit(&ctx.payer, &id, &1_000);
+        assert_eq!(client.get_invoice(&id).status, EscrowStatus::Active);
+
+        ctx.set_time(DEADLINE + 100);
+        assert_eq!(client.get_refund_grace_status(&id), RefundGraceStatus::Active);
+        client.release(&id);
+        assert_eq!(client.get_invoice(&id).status, EscrowStatus::Released);
+    }
+
+    #[test]
+    fn test_grace_views_unknown_invoice() {
+        let ctx = setup_ctx();
+        let client = ctx.client();
+        assert_eq!(client.try_get_refund_grace_status(&99), Err(Ok(Error::InvoiceNotFound)));
+        assert_eq!(client.try_refund_grace_remaining(&99), Err(Ok(Error::InvoiceNotFound)));
+        assert_eq!(client.try_refund_available_after(&99), Err(Ok(Error::InvoiceNotFound)));
+    }
+}

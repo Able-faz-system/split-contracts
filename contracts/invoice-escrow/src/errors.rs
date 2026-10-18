@@ -85,4 +85,10 @@ pub enum Error {
     ScheduleLedgerNotReached = 36,
     /// No active release schedule exists for this invoice.
     ScheduleNotFound = 37,
+    /// The refund grace period is still running; refund is not permitted yet.
+    RefundGraceActive = 38,
+    /// Grace period exceeds `MAX_REFUND_GRACE_SECS`.
+    InvalidGracePeriod = 39,
+    /// The refund grace period has already elapsed or been waived.
+    RefundGraceElapsed = 40,
 }

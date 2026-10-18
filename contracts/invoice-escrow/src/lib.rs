@@ -9,6 +9,8 @@
 //! - **Oracle condition guards**: optional price-feed condition, with a
 //!   fallback oracle, that must hold before release
 //! - **Scheduled release**: optional time + ledger-count delay before release
+//! - **Refund grace period**: configurable delay after the deadline before
+//!   refunds can be processed, with admin extend / waive overrides
 //!
 //! # Admin Transfer Flow
 //!
@@ -35,8 +37,8 @@ use soroban_sdk::{
 use oracle::PriceOracleClient;
 use types::{
     ApprovalStatus, BlacklistEntry, CosignerApproval, EscrowInvoice, EscrowReleased, EscrowStatus,
-    OracleCondition, OracleReading, OracleSource, PriceComparator, PriceData, ReleaseSchedule,
-    ScheduleStatus,
+    OracleCondition, OracleReading, OracleSource, PriceComparator, PriceData, RefundGrace,
+    RefundGraceStatus, ReleaseSchedule, ScheduleStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -56,6 +58,11 @@ fn pending_admin_key() -> Symbol {
 /// Instance storage: monotonic invoice counter.
 fn counter_key() -> Symbol {
     symbol_short!("counter")
+}
+
+/// Instance storage: default refund grace period (seconds) applied to new invoices.
+fn default_grace_key() -> Symbol {
+    symbol_short!("grace_def")
 }
 
 /// Persistent storage: per-invoice record keyed by `(escrow, id)`.
@@ -93,6 +100,11 @@ fn schedule_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("schedule"), id)
 }
 
+/// Persistent storage: refund grace configuration for an invoice.
+fn grace_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("grace"), id)
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -111,6 +123,9 @@ const MAX_SCHEDULE_LEDGERS: u32 = 6_312_000;
 /// Extra ledgers of TTL kept on a scheduled invoice beyond its unlock
 /// ledger (~1 day), so the record is still live when it becomes due.
 const SCHEDULE_TTL_BUFFER_LEDGERS: u32 = 17_280;
+
+/// Maximum refund grace period, including admin extensions (30 days).
+const MAX_REFUND_GRACE_SECS: u64 = 30 * 24 * 60 * 60;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -305,6 +320,43 @@ fn cast_vote(env: &Env, signer: Address, invoice_id: u64, approve: bool) -> Resu
     Ok(approval.status)
 }
 
+fn get_grace(env: &Env, id: u64) -> Option<RefundGrace> {
+    env.storage().persistent().get(&grace_key(id))
+}
+
+fn save_grace(env: &Env, id: u64, grace: &RefundGrace) {
+    env.storage().persistent().set(&grace_key(id), grace);
+}
+
+/// Timestamp after which refunds are allowed: the deadline plus any
+/// un-waived grace period.
+fn refund_opens_at(invoice: &EscrowInvoice, grace: &Option<RefundGrace>) -> u64 {
+    match grace {
+        Some(g) if !g.waived => invoice
+            .deadline
+            .saturating_add(g.grace_secs)
+            .saturating_add(g.extension_secs),
+        _ => invoice.deadline,
+    }
+}
+
+fn grace_status(env: &Env, invoice: &EscrowInvoice, grace: &Option<RefundGrace>) -> RefundGraceStatus {
+    let g = match grace {
+        Some(g) if g.grace_secs > 0 || g.extension_secs > 0 || g.waived => g,
+        _ => return RefundGraceStatus::NoGrace,
+    };
+    let now = env.ledger().timestamp();
+    if g.waived {
+        RefundGraceStatus::Waived
+    } else if now <= invoice.deadline {
+        RefundGraceStatus::NotStarted
+    } else if now <= refund_opens_at(invoice, grace) {
+        RefundGraceStatus::Active
+    } else {
+        RefundGraceStatus::Elapsed
+    }
+}
+
 /// Mark the invoice released and transfer `total_amount` to the creator.
 fn execute_release(env: &Env, id: u64, invoice: &mut EscrowInvoice) -> (Address, i128) {
     let total = invoice.total_amount;
@@ -466,6 +518,24 @@ fn emit_schedule_executed(env: &Env, id: u64) {
     env.events().publish(
         (symbol_short!("escrow"), symbol_short!("sched_exe"), id),
         (env.ledger().timestamp(), env.ledger().sequence()),
+    );
+}
+
+/// Topics: `(escrow, grace_def)` — Data: `grace_secs`
+fn emit_default_grace_set(env: &Env, grace_secs: u64) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("grace_def")),
+        grace_secs,
+    );
+}
+
+/// Topics: `(escrow, <action>, id)` — Data: `(grace_secs, extension_secs, waived)`
+///
+/// `action` is one of `grace_set`, `grace_ext` or `grace_wvd`.
+fn emit_grace_changed(env: &Env, action: Symbol, id: u64, grace: &RefundGrace) {
+    env.events().publish(
+        (symbol_short!("escrow"), action, id),
+        (grace.grace_secs, grace.extension_secs, grace.waived),
     );
 }
 
@@ -673,6 +743,26 @@ impl InvoiceEscrowContract {
             status: EscrowStatus::Pending,
         };
         save_invoice(&env, id, &invoice);
+
+        // Snapshot the current default grace period so later changes to the
+        // default never alter the terms of an existing invoice.
+        let default_grace: u64 = env
+            .storage()
+            .instance()
+            .get(&default_grace_key())
+            .unwrap_or(0);
+        if default_grace > 0 {
+            save_grace(
+                &env,
+                id,
+                &RefundGrace {
+                    grace_secs: default_grace,
+                    extension_secs: 0,
+                    waived: false,
+                },
+            );
+        }
+
         emit_invoice_created(&env, id, &creator, total_amount, deadline);
         Ok(id)
     }
@@ -805,8 +895,8 @@ impl InvoiceEscrowContract {
     /// Refund all depositors after the deadline passes without full funding.
     ///
     /// Iterates over `payers` and returns each payer's recorded deposit.
-    /// Callable by anyone once the deadline has passed and the invoice is not
-    /// already released.
+    /// Callable by anyone once the deadline — and any refund grace period
+    /// that follows it — has passed and the invoice is not already released.
     ///
     /// # Arguments
     /// * `invoice_id` — Target invoice.
@@ -816,6 +906,8 @@ impl InvoiceEscrowContract {
     /// * [`Error::InvoiceNotFound`]    — Unknown invoice ID.
     /// * [`Error::InvalidStatus`]      — Invoice already released or refunded.
     /// * [`Error::DeadlineNotPassed`]  — Deadline has not expired yet.
+    /// * [`Error::RefundGraceActive`]  — Deadline passed but the grace period
+    ///   is still running (and has not been waived).
     pub fn refund(env: Env, invoice_id: u64, payers: Vec<Address>) -> Result<(), Error> {
         let mut invoice = get_invoice(&env, invoice_id)?;
 
@@ -825,8 +917,12 @@ impl InvoiceEscrowContract {
         {
             return Err(Error::InvalidStatus);
         }
-        if env.ledger().timestamp() <= invoice.deadline {
+        let now = env.ledger().timestamp();
+        if now <= invoice.deadline {
             return Err(Error::DeadlineNotPassed);
+        }
+        if now <= refund_opens_at(&invoice, &get_grace(&env, invoice_id)) {
+            return Err(Error::RefundGraceActive);
         }
 
         let token_client = token::Client::new(&env, &invoice.token);
@@ -1196,6 +1292,167 @@ impl InvoiceEscrowContract {
     }
 
     // -----------------------------------------------------------------------
+    // Refund grace period
+    // -----------------------------------------------------------------------
+
+    /// Set the default refund grace period applied to invoices created from
+    /// now on. Existing invoices keep the grace period they were created with.
+    ///
+    /// # Events
+    /// Emits `(escrow, grace_def)` with `grace_secs`.
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`]     — Contract not initialized.
+    /// * [`Error::InvalidGracePeriod`] — `grace_secs > MAX_REFUND_GRACE_SECS`.
+    pub fn set_default_refund_grace(env: Env, grace_secs: u64) -> Result<(), Error> {
+        if !env.storage().instance().has(&admin_key()) {
+            return Err(Error::NotInitialized);
+        }
+        require_admin(&env);
+        if grace_secs > MAX_REFUND_GRACE_SECS {
+            return Err(Error::InvalidGracePeriod);
+        }
+        env.storage().instance().set(&default_grace_key(), &grace_secs);
+        emit_default_grace_set(&env, grace_secs);
+        Ok(())
+    }
+
+    /// Return the default refund grace period (seconds) for new invoices.
+    pub fn get_default_refund_grace(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&default_grace_key())
+            .unwrap_or(0)
+    }
+
+    /// Set an invoice's own refund grace period, overriding the default it
+    /// was created with.
+    ///
+    /// Only the creator may do this, and only while the invoice is still
+    /// `Pending` (no deposits yet), so payers always fund against known
+    /// refund terms. Any admin extension is reset.
+    ///
+    /// # Events
+    /// Emits `(escrow, grace_set, id)`.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`]    — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]      — Invoice already has deposits or is closed.
+    /// * [`Error::InvalidGracePeriod`] — `grace_secs > MAX_REFUND_GRACE_SECS`.
+    pub fn set_refund_grace(env: Env, invoice_id: u64, grace_secs: u64) -> Result<(), Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        invoice.creator.require_auth();
+        if invoice.status != EscrowStatus::Pending {
+            return Err(Error::InvalidStatus);
+        }
+        if grace_secs > MAX_REFUND_GRACE_SECS {
+            return Err(Error::InvalidGracePeriod);
+        }
+
+        let grace = RefundGrace {
+            grace_secs,
+            extension_secs: 0,
+            waived: false,
+        };
+        save_grace(&env, invoice_id, &grace);
+        emit_grace_changed(&env, symbol_short!("grace_set"), invoice_id, &grace);
+        Ok(())
+    }
+
+    /// Admin override: extend an invoice's refund grace period.
+    ///
+    /// Allowed while the invoice is open and before the grace period has
+    /// elapsed or been waived. The total grace (base + extensions) may not
+    /// exceed `MAX_REFUND_GRACE_SECS`.
+    ///
+    /// # Events
+    /// Emits `(escrow, grace_ext, id)`.
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`]     — Contract not initialized.
+    /// * [`Error::InvoiceNotFound`]    — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]      — Invoice is no longer open.
+    /// * [`Error::InvalidGracePeriod`] — Zero extension or total too long.
+    /// * [`Error::RefundGraceElapsed`] — Grace already elapsed or waived.
+    pub fn extend_refund_grace(env: Env, invoice_id: u64, extra_secs: u64) -> Result<(), Error> {
+        if !env.storage().instance().has(&admin_key()) {
+            return Err(Error::NotInitialized);
+        }
+        require_admin(&env);
+        let invoice = get_invoice(&env, invoice_id)?;
+        if !is_open(&invoice) {
+            return Err(Error::InvalidStatus);
+        }
+
+        let current = get_grace(&env, invoice_id);
+        match grace_status(&env, &invoice, &current) {
+            RefundGraceStatus::Elapsed | RefundGraceStatus::Waived => {
+                return Err(Error::RefundGraceElapsed)
+            }
+            RefundGraceStatus::NoGrace if env.ledger().timestamp() > invoice.deadline => {
+                // No grace and deadline passed: refunds are already open.
+                return Err(Error::RefundGraceElapsed);
+            }
+            _ => {}
+        }
+
+        let mut grace = current.unwrap_or(RefundGrace {
+            grace_secs: 0,
+            extension_secs: 0,
+            waived: false,
+        });
+        let total = grace
+            .grace_secs
+            .checked_add(grace.extension_secs)
+            .and_then(|t| t.checked_add(extra_secs))
+            .ok_or(Error::InvalidGracePeriod)?;
+        if extra_secs == 0 || total > MAX_REFUND_GRACE_SECS {
+            return Err(Error::InvalidGracePeriod);
+        }
+
+        grace.extension_secs += extra_secs;
+        save_grace(&env, invoice_id, &grace);
+        emit_grace_changed(&env, symbol_short!("grace_ext"), invoice_id, &grace);
+        Ok(())
+    }
+
+    /// Admin override: waive an invoice's refund grace period so refunds can
+    /// be processed as soon as the deadline has passed.
+    ///
+    /// # Events
+    /// Emits `(escrow, grace_wvd, id)`.
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`]     — Contract not initialized.
+    /// * [`Error::InvoiceNotFound`]    — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]      — Invoice is no longer open.
+    /// * [`Error::RefundGraceElapsed`] — No grace to waive (none configured,
+    ///   already elapsed, or already waived).
+    pub fn waive_refund_grace(env: Env, invoice_id: u64) -> Result<(), Error> {
+        if !env.storage().instance().has(&admin_key()) {
+            return Err(Error::NotInitialized);
+        }
+        require_admin(&env);
+        let invoice = get_invoice(&env, invoice_id)?;
+        if !is_open(&invoice) {
+            return Err(Error::InvalidStatus);
+        }
+
+        let current = get_grace(&env, invoice_id);
+        match grace_status(&env, &invoice, &current) {
+            RefundGraceStatus::NotStarted | RefundGraceStatus::Active => {}
+            _ => return Err(Error::RefundGraceElapsed),
+        }
+
+        // `grace_status` only reports NotStarted/Active when a record exists.
+        let mut grace = current.unwrap();
+        grace.waived = true;
+        save_grace(&env, invoice_id, &grace);
+        emit_grace_changed(&env, symbol_short!("grace_wvd"), invoice_id, &grace);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Payer blacklist
     // -----------------------------------------------------------------------
 
@@ -1511,6 +1768,45 @@ impl InvoiceEscrowContract {
         get_schedule(&env, invoice_id)
             .filter(|s| s.status == ScheduleStatus::Scheduled)
             .map_or(0, |s| s.unlock_ledger.saturating_sub(env.ledger().sequence()))
+    }
+
+    /// Return the refund grace configuration for an invoice, if any.
+    pub fn get_refund_grace(env: Env, invoice_id: u64) -> Option<RefundGrace> {
+        get_grace(&env, invoice_id)
+    }
+
+    /// Return where the invoice is in its refund grace timeline.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`] — Unknown invoice ID.
+    pub fn get_refund_grace_status(env: Env, invoice_id: u64) -> Result<RefundGraceStatus, Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        Ok(grace_status(&env, &invoice, &get_grace(&env, invoice_id)))
+    }
+
+    /// Return the timestamp after which refunds may be processed (deadline
+    /// plus any un-waived grace period).
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`] — Unknown invoice ID.
+    pub fn refund_available_after(env: Env, invoice_id: u64) -> Result<u64, Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        Ok(refund_opens_at(&invoice, &get_grace(&env, invoice_id)))
+    }
+
+    /// Seconds left on the refund grace timer.
+    ///
+    /// Before the deadline this is the full grace window; after the deadline
+    /// it counts down to `0`. Always `0` when there is no grace period or it
+    /// has been waived.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`] — Unknown invoice ID.
+    pub fn refund_grace_remaining(env: Env, invoice_id: u64) -> Result<u64, Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        let opens_at = refund_opens_at(&invoice, &get_grace(&env, invoice_id));
+        let from = env.ledger().timestamp().max(invoice.deadline);
+        Ok(opens_at.saturating_sub(from))
     }
 
     /// Return `true` if the payer is blacklisted with a finalised and upheld entry.
