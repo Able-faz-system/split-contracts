@@ -1659,6 +1659,52 @@ pub struct ComputeEstimate {
 pub struct CircuitBreakerStatus {
     pub active: bool,
     pub reason: Option<String>,
+    /// Issue #923: current state machine position.
+    pub state: CircuitBreakerState,
+    /// Issue #923: ledger at which the breaker last opened (0 if never / closed).
+    pub opened_at_ledger: u32,
+    /// Issue #923: ledger at which recovery (HalfOpen) began (0 if not recovering).
+    pub recovery_started_ledger: u32,
+    /// Issue #923: failures reported in the current failure window.
+    pub failure_count: u32,
+}
+
+/// Issue #923: Circuit breaker state machine.
+///
+/// - `Closed`: normal operation.
+/// - `Open`: tripped; all guarded mutating operations fail except exempt ones.
+/// - `HalfOpen`: recovery probation; operations resume, but any reported
+///   failure re-opens the breaker immediately.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CircuitBreakerState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+/// Issue #923: Activation and recovery parameters for the circuit breaker.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CircuitBreakerConfig {
+    /// Failures within `failure_window_ledgers` that trip the breaker. `0` disables auto-trip.
+    pub failure_threshold: u32,
+    /// Length of the failure counting window, in ledgers.
+    pub failure_window_ledgers: u32,
+    /// Minimum ledgers the breaker must spend in `HalfOpen` before recovery can complete.
+    pub recovery_ledgers: u32,
+}
+
+/// Issue #923: A recorded circuit breaker state transition.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CircuitBreakerTransition {
+    pub from: CircuitBreakerState,
+    pub to: CircuitBreakerState,
+    pub actor: Address,
+    pub reason: String,
+    pub ledger: u32,
+    pub timestamp: u64,
 }
 
 /// Issue #922: Fee waiver record for a whitelisted creator.

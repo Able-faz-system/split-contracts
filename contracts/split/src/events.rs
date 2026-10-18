@@ -26,8 +26,11 @@
 //! dynamically.
 
 use crate::storage_keys::ev_seq_key;
-use crate::types::{DisputeOutcome, FeeSplit, InvoicePhase, InvoiceStatus, OverfundingPolicy, RepScore, TimelockAction};
-use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String, Vec};
+use crate::types::{
+    CircuitBreakerState, DisputeOutcome, FeeSplit, InvoicePhase, InvoiceStatus, OverfundingPolicy,
+    RepScore, TimelockAction,
+};
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec};
 
 // ---------------------------------------------------------------------------
 // Event sequence helper (per-invoice, temporary-storage counter)
@@ -595,6 +598,51 @@ pub fn circuit_breaker_activated(env: &Env, reason: &String) {
 pub fn circuit_breaker_deactivated(env: &Env) {
     env.events()
         .publish((symbol_short!("split"), symbol_short!("cb_dact")), ());
+}
+
+/// Issue #923: Emitted on every circuit breaker state transition.
+/// Topics: (split, cb_state)
+/// Data: (from, to, actor, reason, ledger)
+pub fn circuit_breaker_state_changed(
+    env: &Env,
+    from: CircuitBreakerState,
+    to: CircuitBreakerState,
+    actor: &Address,
+    reason: &String,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("cb_state")),
+        (from, to, actor.clone(), reason.clone(), env.ledger().sequence()),
+    );
+}
+
+/// Issue #923: Emitted when a failure is reported against the circuit breaker.
+/// Topics: (split, cb_fail, reporter)
+/// Data: (failure_count, failure_threshold)
+pub fn circuit_breaker_failure_reported(
+    env: &Env,
+    reporter: &Address,
+    failure_count: u32,
+    failure_threshold: u32,
+) {
+    env.events().publish(
+        (
+            symbol_short!("split"),
+            symbol_short!("cb_fail"),
+            reporter.clone(),
+        ),
+        (failure_count, failure_threshold),
+    );
+}
+
+/// Issue #923: Emitted when an operation is added to or removed from the exemption list.
+/// Topics: (split, cb_exmpt)
+/// Data: (function, exempt)
+pub fn circuit_breaker_exemption_set(env: &Env, function: &Symbol, exempt: bool) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("cb_exmpt")),
+        (function.clone(), exempt),
+    );
 }
 
 /// Issue #296: Emitted when a fee waiver is granted to a creator.

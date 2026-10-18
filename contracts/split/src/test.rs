@@ -8834,3 +8834,190 @@ fn test_922_purge_frees_capacity_for_new_waivers() {
     assert!(c.has_fee_waiver(&creator));
     assert_eq!(c.list_fee_waivers().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #923: Circuit breaker state machine
+// ---------------------------------------------------------------------------
+
+fn setup_circuit_breaker() -> (Env, Address, Address, Address) {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+    env.ledger().set_sequence_number(100);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    (env, contract_id, token_id, admin)
+}
+
+#[test]
+fn test_923_state_defaults_closed() {
+    let (env, contract_id, _token_id, _admin) = setup_circuit_breaker();
+    let c = client(&env, &contract_id);
+    let status = c.get_circuit_breaker_status();
+    assert_eq!(status.state, types::CircuitBreakerState::Closed);
+    assert_eq!(status.failure_count, 0);
+}
+
+#[test]
+fn test_923_activate_opens_and_records_ledger() {
+    let (env, contract_id, _token_id, admin) = setup_circuit_breaker();
+    let c = client(&env, &contract_id);
+    c.activate_circuit_breaker(&admin, &String::from_str(&env, "exploit"));
+    let status = c.get_circuit_breaker_status();
+    assert_eq!(status.state, types::CircuitBreakerState::Open);
+    assert!(status.active);
+    assert_eq!(status.opened_at_ledger, 100);
+}
+
+#[test]
+fn test_923_recovery_flow_half_open_then_closed() {
+    let (env, contract_id, _token_id, admin) = setup_circuit_breaker();
+    let c = client(&env, &contract_id);
+    c.activate_circuit_breaker(&admin, &String::from_str(&env, "exploit"));
+
+    c.begin_circuit_recovery(&admin);
+    let status = c.get_circuit_breaker_status();
+    assert_eq!(status.state, types::CircuitBreakerState::HalfOpen);
+    assert!(!status.active, "operations resume during recovery");
+    assert_eq!(status.recovery_started_ledger, 100);
+
+    env.ledger().set_sequence_number(100 + 120);
+    c.complete_circuit_recovery(&admin);
+    let status = c.get_circuit_breaker_status();
+    assert_eq!(status.state, types::CircuitBreakerState::Closed);
+    assert!(status.reason.is_none());
+}
+
+#[test]
+#[should_panic(expected = "recovery period not elapsed")]
+fn test_923_complete_recovery_before_probation_fails() {
+    let (env, contract_id, _token_id, admin) = setup_circuit_breaker();
+    let c = client(&env, &contract_id);
+    c.activate_circuit_breaker(&admin, &String::from_str(&env, "exploit"));
+    c.begin_circuit_recovery(&admin);
+    env.ledger().set_sequence_number(150);
+    c.complete_circuit_recovery(&admin);
+}
+
+#[test]
+#[should_panic(expected = "invalid circuit breaker transition")]
+fn test_923_begin_recovery_when_closed_fails() {
+    let (env, contract_id, _token_id, admin) = setup_circuit_breaker();
+    let c = client(&env, &contract_id);
+    c.begin_circuit_recovery(&admin);
+}
+
+#[test]
+fn test_923_failure_threshold_trips_breaker() {
+    let (env, contract_id, _token_id, admin) = setup_circuit_breaker();
+    let c = client(&env, &contract_id);
+    let reason = String::from_str(&env, "oracle anomaly");
+
+    assert_eq!(c.report_circuit_failure(&admin, &reason), types::CircuitBreakerState::Closed);
+    assert_eq!(c.report_circuit_failure(&admin, &reason), types::CircuitBreakerState::Closed);
+    assert_eq!(c.get_circuit_breaker_status().failure_count, 2);
+    assert_eq!(c.report_circuit_failure(&admin, &reason), types::CircuitBreakerState::Open);
+
+    let status = c.get_circuit_breaker_status();
+    assert!(status.active);
+    assert_eq!(status.reason, Some(reason));
+}
+
+#[test]
+fn test_923_failures_outside_window_do_not_accumulate() {
+    let (env, contract_id, _token_id, admin) = setup_circuit_breaker();
+    let c = client(&env, &contract_id);
+    let reason = String::from_str(&env, "anomaly");
+
+    c.report_circuit_failure(&admin, &reason);
+    c.report_circuit_failure(&admin, &reason);
+    env.ledger().set_sequence_number(100 + 720);
+    assert_eq!(c.report_circuit_failure(&admin, &reason), types::CircuitBreakerState::Closed);
+    assert_eq!(c.get_circuit_breaker_status().failure_count, 1);
+}
+
+#[test]
+fn test_923_failure_during_recovery_reopens() {
+    let (env, contract_id, _token_id, admin) = setup_circuit_breaker();
+    let c = client(&env, &contract_id);
+    c.activate_circuit_breaker(&admin, &String::from_str(&env, "exploit"));
+    c.begin_circuit_recovery(&admin);
+
+    let state = c.report_circuit_failure(&admin, &String::from_str(&env, "still broken"));
+    assert_eq!(state, types::CircuitBreakerState::Open);
+}
+
+#[test]
+fn test_923_zero_threshold_disables_auto_trip() {
+    let (env, contract_id, _token_id, admin) = setup_circuit_breaker();
+    let c = client(&env, &contract_id);
+    c.set_circuit_breaker_config(
+        &admin,
+        &types::CircuitBreakerConfig {
+            failure_threshold: 0,
+            failure_window_ledgers: 720,
+            recovery_ledgers: 10,
+        },
+    );
+    for _ in 0..5 {
+        c.report_circuit_failure(&admin, &String::from_str(&env, "noise"));
+    }
+    assert_eq!(c.get_circuit_breaker_status().state, types::CircuitBreakerState::Closed);
+}
+
+#[test]
+fn test_923_exempt_refund_allowed_while_open() {
+    let (env, contract_id, token_id, admin) = setup_circuit_breaker();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 2_000);
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false, &None);
+
+    c.activate_circuit_breaker(&admin, &String::from_str(&env, "exploit"));
+    c.set_circuit_breaker_exemption(&admin, &symbol_short!("refund"), &true);
+    assert_eq!(c.get_circuit_breaker_exemptions().len(), 1);
+
+    env.ledger().set_timestamp(3_000);
+    c.refund(&id);
+    assert_eq!(tk.balance(&payer), 500, "exempt refund must go through while open");
+}
+
+#[test]
+#[should_panic(expected = "ContractPaused")]
+fn test_923_non_exempt_pay_blocked_while_open() {
+    let (env, contract_id, token_id, admin) = setup_circuit_breaker();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.activate_circuit_breaker(&admin, &String::from_str(&env, "exploit"));
+    c.set_circuit_breaker_exemption(&admin, &symbol_short!("refund"), &true);
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false, &None);
+}
+
+#[test]
+fn test_923_history_logs_transitions() {
+    let (env, contract_id, _token_id, admin) = setup_circuit_breaker();
+    let c = client(&env, &contract_id);
+    c.activate_circuit_breaker(&admin, &String::from_str(&env, "exploit"));
+    c.begin_circuit_recovery(&admin);
+    c.deactivate_circuit_breaker(&admin);
+
+    let history = c.get_circuit_breaker_history();
+    assert_eq!(history.len(), 3);
+    let first = history.get(0).unwrap();
+    assert_eq!(first.from, types::CircuitBreakerState::Closed);
+    assert_eq!(first.to, types::CircuitBreakerState::Open);
+    assert_eq!(first.actor, admin);
+    assert_eq!(history.get(2).unwrap().to, types::CircuitBreakerState::Closed);
+    assert!(has_circuit_breaker_event(&env, "cb_state"));
+}

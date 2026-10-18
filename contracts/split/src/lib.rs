@@ -39,6 +39,15 @@ const STROOPS_PER_10K_INSTRUCTIONS: u64 = 1;
 const MAX_FEE_WAIVER_ENTRIES: usize = 100;
 /// Issue #922: Maximum entries retained in the fee waiver audit log (oldest dropped first).
 const MAX_FEE_WAIVER_AUDIT_ENTRIES: u32 = 200;
+
+/// Issue #923: Default failures within the window that trip the circuit breaker.
+const DEFAULT_CB_FAILURE_THRESHOLD: u32 = 3;
+/// Issue #923: Default failure counting window (~1 hour at ~5 s/ledger).
+const DEFAULT_CB_FAILURE_WINDOW_LEDGERS: u32 = 720;
+/// Issue #923: Default HalfOpen probation before recovery can complete (~10 min).
+const DEFAULT_CB_RECOVERY_LEDGERS: u32 = 120;
+/// Issue #923: Maximum circuit breaker transitions retained in history.
+const MAX_CB_HISTORY_ENTRIES: u32 = 50;
 const DEFAULT_COMMITMENT_EXPIRY_LEDGERS: u32 = 100;
 
 /// Fixed-point scale for oracle-priced invoices: the oracle's `price()` return
@@ -89,7 +98,8 @@ use soroban_sdk::{
 const MAX_PARENT_DEPTH: u32 = 10;
 
 use types::{
-    AdminAction, AdminRole, AdminSet, AuditEntry, Bid, CircuitBreakerStatus,
+    AdminAction, AdminRole, AdminSet, AuditEntry, Bid, CircuitBreakerConfig, CircuitBreakerState,
+    CircuitBreakerStatus, CircuitBreakerTransition,
     CloneOverrides, CompactInvoice, CompactMigrateResult, CompletionProof, ComputeEstimate,
     ConfidentialPayment, ContributionResult, CreateInvoiceParams, CreatorStats, DelayedPayout,
     DisputeOutcome, DisputeRecord, DisputeStatus, FeeBracket, FeeSplit, FeeTier, FeeWaiver,
@@ -202,6 +212,41 @@ fn circuit_breaker_key() -> Symbol {
 /// Issue #297: Circuit breaker reason storage key.
 fn circuit_breaker_reason_key() -> Symbol {
     symbol_short!("cb_rsn")
+}
+
+/// Issue #923: Circuit breaker state machine position.
+fn circuit_breaker_state_key() -> Symbol {
+    symbol_short!("cb_state")
+}
+
+/// Issue #923: Circuit breaker activation / recovery configuration.
+fn circuit_breaker_config_key() -> Symbol {
+    symbol_short!("cb_cfg")
+}
+
+/// Issue #923: Operations (function symbols) allowed while the breaker is open.
+fn circuit_breaker_exempt_key() -> Symbol {
+    symbol_short!("cb_exempt")
+}
+
+/// Issue #923: (failure_count, window_start_ledger) for auto-trip detection.
+fn circuit_breaker_failures_key() -> Symbol {
+    symbol_short!("cb_fails")
+}
+
+/// Issue #923: Ledger at which the breaker last opened.
+fn circuit_breaker_opened_key() -> Symbol {
+    symbol_short!("cb_open")
+}
+
+/// Issue #923: Ledger at which HalfOpen recovery began.
+fn circuit_breaker_recovery_key() -> Symbol {
+    symbol_short!("cb_recov")
+}
+
+/// Issue #923: Bounded history of state transitions.
+fn circuit_breaker_history_key() -> Symbol {
+    symbol_short!("cb_hist")
 }
 
 /// Issue #295: Confidential payment storage key per (invoice_id, payer).
@@ -2240,12 +2285,19 @@ fn assert_not_paused(env: &Env) -> Result<(), ContractError> {
         return Err(ContractError::ContractPaused);
     }
     // Issue #297: also check circuit breaker.
-    let cb_active: bool = env
-        .storage()
-        .persistent()
-        .get(&circuit_breaker_key())
-        .unwrap_or(false);
-    if cb_active {
+    if circuit_breaker_blocks(env, None) {
+        return Err(ContractError::ContractPaused);
+    }
+    Ok(())
+}
+
+/// Issue #923: Same as [`assert_not_paused`], but lets `function` through an
+/// open circuit breaker when it is on the exemption list.
+fn assert_not_paused_for(env: &Env, function: &Symbol) -> Result<(), ContractError> {
+    if is_paused(env) {
+        return Err(ContractError::ContractPaused);
+    }
+    if circuit_breaker_blocks(env, Some(function)) {
         return Err(ContractError::ContractPaused);
     }
     Ok(())
@@ -2307,7 +2359,8 @@ fn require_admin_role_unguarded(env: &Env, admin: &Address, min_role: AdminRole)
 }
 
 fn require_fn_not_paused(env: &Env, name: &Symbol) {
-    require_not_paused(env);
+    migrations::require_schema_current(env);
+    assert_not_paused_for(env, name).expect("contract is paused");
     let paused_fns: Vec<Symbol> = env
         .storage()
         .persistent()
@@ -2316,6 +2369,114 @@ fn require_fn_not_paused(env: &Env, name: &Symbol) {
     if paused_fns.iter().any(|f| f == *name) {
         panic!("function paused");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #923: Circuit breaker helpers
+// ---------------------------------------------------------------------------
+
+/// True when the breaker is open and `function` (if given) is not exempt.
+/// With `function == None` no exemption applies.
+fn circuit_breaker_blocks(env: &Env, function: Option<&Symbol>) -> bool {
+    let active: bool = env
+        .storage()
+        .persistent()
+        .get(&circuit_breaker_key())
+        .unwrap_or(false);
+    if !active {
+        return false;
+    }
+    match function {
+        Some(f) => !load_circuit_breaker_exemptions(env).iter().any(|e| e == *f),
+        None => true,
+    }
+}
+
+fn load_circuit_breaker_exemptions(env: &Env) -> Vec<Symbol> {
+    env.storage()
+        .persistent()
+        .get(&circuit_breaker_exempt_key())
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Current state. Contracts that only ever set the issue #297 flag have no
+/// stored state, so it is derived from the flag.
+fn load_circuit_breaker_state(env: &Env) -> CircuitBreakerState {
+    env.storage()
+        .persistent()
+        .get(&circuit_breaker_state_key())
+        .unwrap_or_else(|| {
+            let active: bool = env
+                .storage()
+                .persistent()
+                .get(&circuit_breaker_key())
+                .unwrap_or(false);
+            if active {
+                CircuitBreakerState::Open
+            } else {
+                CircuitBreakerState::Closed
+            }
+        })
+}
+
+fn load_circuit_breaker_config(env: &Env) -> CircuitBreakerConfig {
+    env.storage()
+        .persistent()
+        .get(&circuit_breaker_config_key())
+        .unwrap_or(CircuitBreakerConfig {
+            failure_threshold: DEFAULT_CB_FAILURE_THRESHOLD,
+            failure_window_ledgers: DEFAULT_CB_FAILURE_WINDOW_LEDGERS,
+            recovery_ledgers: DEFAULT_CB_RECOVERY_LEDGERS,
+        })
+}
+
+/// Move the breaker to `to`, keeping the issue #297 flag in sync, and log the transition.
+fn transition_circuit_breaker(
+    env: &Env,
+    to: CircuitBreakerState,
+    actor: &Address,
+    reason: &String,
+) {
+    let from = load_circuit_breaker_state(env);
+    let storage = env.storage().persistent();
+    let ledger = env.ledger().sequence();
+
+    storage.set(&circuit_breaker_state_key(), &to);
+    storage.set(&circuit_breaker_key(), &(to == CircuitBreakerState::Open));
+    storage.remove(&circuit_breaker_failures_key());
+    match to {
+        CircuitBreakerState::Open => {
+            storage.set(&circuit_breaker_reason_key(), reason);
+            storage.set(&circuit_breaker_opened_key(), &ledger);
+            storage.remove(&circuit_breaker_recovery_key());
+        }
+        CircuitBreakerState::HalfOpen => {
+            storage.set(&circuit_breaker_recovery_key(), &ledger);
+        }
+        CircuitBreakerState::Closed => {
+            storage.remove(&circuit_breaker_reason_key());
+            storage.remove(&circuit_breaker_opened_key());
+            storage.remove(&circuit_breaker_recovery_key());
+        }
+    }
+
+    let mut history: Vec<CircuitBreakerTransition> = storage
+        .get(&circuit_breaker_history_key())
+        .unwrap_or_else(|| Vec::new(env));
+    history.push_back(CircuitBreakerTransition {
+        from,
+        to,
+        actor: actor.clone(),
+        reason: reason.clone(),
+        ledger,
+        timestamp: env.ledger().timestamp(),
+    });
+    while history.len() > MAX_CB_HISTORY_ENTRIES {
+        history.pop_front();
+    }
+    storage.set(&circuit_breaker_history_key(), &history);
+
+    events::circuit_breaker_state_changed(env, from, to, actor, reason);
 }
 
 // ---------------------------------------------------------------------------
@@ -13852,46 +14013,194 @@ impl SplitContract {
     }
 
     // -----------------------------------------------------------------------
-    // Issue #297: Contract-wide circuit breaker
+    // Issue #297 / #923: Contract-wide circuit breaker
     // -----------------------------------------------------------------------
 
-    /// Activate the circuit breaker. Admin-only. Halts all mutating entry points.
+    /// Open the circuit breaker. Admin-only. Halts all guarded mutating entry
+    /// points except those on the exemption list. Valid from any state;
+    /// calling it while already open updates the reason.
     pub fn activate_circuit_breaker(env: Env, admin: Address, reason: String) {
         require_admin_role(&env, &admin, AdminRole::SuperAdmin);
-        env.storage()
-            .persistent()
-            .set(&circuit_breaker_key(), &true);
-        env.storage()
-            .persistent()
-            .set(&circuit_breaker_reason_key(), &reason.clone());
+        transition_circuit_breaker(&env, CircuitBreakerState::Open, &admin, &reason);
         events::circuit_breaker_activated(&env, &reason);
     }
 
-    /// Deactivate the circuit breaker. Admin-only.
+    /// Close the circuit breaker immediately, skipping recovery probation.
+    /// Admin-only emergency override; valid from any state.
     pub fn deactivate_circuit_breaker(env: Env, admin: Address) {
         require_admin_role(&env, &admin, AdminRole::SuperAdmin);
-        env.storage()
-            .persistent()
-            .set(&circuit_breaker_key(), &false);
-        env.storage()
-            .persistent()
-            .remove(&circuit_breaker_reason_key());
+        transition_circuit_breaker(
+            &env,
+            CircuitBreakerState::Closed,
+            &admin,
+            &String::from_str(&env, "manual deactivation"),
+        );
         events::circuit_breaker_deactivated(&env);
+    }
+
+    /// Issue #923: Start recovery (Open -> HalfOpen). Admin-only.
+    /// Operations resume, but any failure reported during probation re-opens the breaker.
+    pub fn begin_circuit_recovery(env: Env, admin: Address) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        assert!(
+            load_circuit_breaker_state(&env) == CircuitBreakerState::Open,
+            "invalid circuit breaker transition"
+        );
+        transition_circuit_breaker(
+            &env,
+            CircuitBreakerState::HalfOpen,
+            &admin,
+            &String::from_str(&env, "recovery started"),
+        );
+    }
+
+    /// Issue #923: Finish recovery (HalfOpen -> Closed) once the configured
+    /// probation period has elapsed. Admin-only.
+    pub fn complete_circuit_recovery(env: Env, admin: Address) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        assert!(
+            load_circuit_breaker_state(&env) == CircuitBreakerState::HalfOpen,
+            "invalid circuit breaker transition"
+        );
+        let started: u32 = env
+            .storage()
+            .persistent()
+            .get(&circuit_breaker_recovery_key())
+            .unwrap_or(0);
+        let config = load_circuit_breaker_config(&env);
+        assert!(
+            env.ledger().sequence() >= started.saturating_add(config.recovery_ledgers),
+            "recovery period not elapsed"
+        );
+        transition_circuit_breaker(
+            &env,
+            CircuitBreakerState::Closed,
+            &admin,
+            &String::from_str(&env, "recovery complete"),
+        );
+        events::circuit_breaker_deactivated(&env);
+    }
+
+    /// Issue #923: Report an operational failure or anomaly. Operator+ only.
+    ///
+    /// Activation conditions:
+    /// - `Closed`: the breaker opens once `failure_threshold` failures are
+    ///   reported within `failure_window_ledgers` (a threshold of 0 disables this).
+    /// - `HalfOpen`: a single failure re-opens the breaker.
+    /// - `Open`: the report is logged only.
+    ///
+    /// Returns the breaker state after the report.
+    pub fn report_circuit_failure(
+        env: Env,
+        reporter: Address,
+        reason: String,
+    ) -> CircuitBreakerState {
+        require_admin_role(&env, &reporter, AdminRole::Operator);
+        let state = load_circuit_breaker_state(&env);
+        let config = load_circuit_breaker_config(&env);
+        let ledger = env.ledger().sequence();
+
+        let (mut count, mut window_start): (u32, u32) = env
+            .storage()
+            .persistent()
+            .get(&circuit_breaker_failures_key())
+            .unwrap_or((0, ledger));
+        if ledger.saturating_sub(window_start) >= config.failure_window_ledgers {
+            count = 0;
+            window_start = ledger;
+        }
+        count = count.saturating_add(1);
+        events::circuit_breaker_failure_reported(&env, &reporter, count, config.failure_threshold);
+
+        let should_trip = match state {
+            CircuitBreakerState::Open => false,
+            CircuitBreakerState::HalfOpen => true,
+            CircuitBreakerState::Closed => {
+                config.failure_threshold > 0 && count >= config.failure_threshold
+            }
+        };
+        if should_trip {
+            transition_circuit_breaker(&env, CircuitBreakerState::Open, &reporter, &reason);
+            events::circuit_breaker_activated(&env, &reason);
+            return CircuitBreakerState::Open;
+        }
+        env.storage()
+            .persistent()
+            .set(&circuit_breaker_failures_key(), &(count, window_start));
+        state
+    }
+
+    /// Issue #923: Configure activation and recovery parameters. Admin-only.
+    pub fn set_circuit_breaker_config(env: Env, admin: Address, config: CircuitBreakerConfig) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        assert!(config.failure_window_ledgers > 0, "failure window must be positive");
+        env.storage()
+            .persistent()
+            .set(&circuit_breaker_config_key(), &config);
+    }
+
+    /// Issue #923: Returns the active circuit breaker configuration.
+    pub fn get_circuit_breaker_config(env: Env) -> CircuitBreakerConfig {
+        load_circuit_breaker_config(&env)
+    }
+
+    /// Issue #923: Allow (or stop allowing) a critical operation while the breaker is open.
+    /// `function` is the guard name the entry point checks, e.g. `refund`. Admin-only.
+    pub fn set_circuit_breaker_exemption(env: Env, admin: Address, function: Symbol, exempt: bool) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        let current = load_circuit_breaker_exemptions(&env);
+        let mut updated: Vec<Symbol> = Vec::new(&env);
+        for f in current.iter() {
+            if f != function {
+                updated.push_back(f);
+            }
+        }
+        if exempt {
+            updated.push_back(function.clone());
+        }
+        env.storage()
+            .persistent()
+            .set(&circuit_breaker_exempt_key(), &updated);
+        events::circuit_breaker_exemption_set(&env, &function, exempt);
+    }
+
+    /// Issue #923: Returns the operations exempt from the circuit breaker.
+    pub fn get_circuit_breaker_exemptions(env: Env) -> Vec<Symbol> {
+        load_circuit_breaker_exemptions(&env)
+    }
+
+    /// Issue #923: Returns recorded state transitions (oldest first, capped at 50).
+    pub fn get_circuit_breaker_history(env: Env) -> Vec<CircuitBreakerTransition> {
+        env.storage()
+            .persistent()
+            .get(&circuit_breaker_history_key())
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Returns the current circuit breaker status.
     /// Read-only — not affected by the circuit breaker.
     pub fn get_circuit_breaker_status(env: Env) -> CircuitBreakerStatus {
-        let active: bool = env
-            .storage()
-            .persistent()
-            .get(&circuit_breaker_key())
-            .unwrap_or(false);
-        let reason: Option<String> = env
-            .storage()
-            .persistent()
-            .get(&circuit_breaker_reason_key());
-        CircuitBreakerStatus { active, reason }
+        let storage = env.storage().persistent();
+        let active: bool = storage.get(&circuit_breaker_key()).unwrap_or(false);
+        let reason: Option<String> = storage.get(&circuit_breaker_reason_key());
+        let config = load_circuit_breaker_config(&env);
+        let failure_count = match storage.get::<_, (u32, u32)>(&circuit_breaker_failures_key()) {
+            Some((count, window_start))
+                if env.ledger().sequence().saturating_sub(window_start)
+                    < config.failure_window_ledgers =>
+            {
+                count
+            }
+            _ => 0,
+        };
+        CircuitBreakerStatus {
+            active,
+            reason,
+            state: load_circuit_breaker_state(&env),
+            opened_at_ledger: storage.get(&circuit_breaker_opened_key()).unwrap_or(0),
+            recovery_started_ledger: storage.get(&circuit_breaker_recovery_key()).unwrap_or(0),
+            failure_count,
+        }
     }
 
     // -----------------------------------------------------------------------
