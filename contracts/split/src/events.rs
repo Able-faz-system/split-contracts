@@ -1918,6 +1918,39 @@ pub fn deadline_extended(env: &Env, invoice_id: u64, old_deadline: u64, new_dead
 // Unit tests for the per-invoice event sequence counter (issue #708)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Issue #918: Invoice prioritization
+// ---------------------------------------------------------------------------
+
+/// Issue #918: Emitted when an invoice's priority is set or updated.
+/// Topics: (split, pri_set, invoice_id)
+/// Data: (set_by, old_score, new_score, tier, event_seq)
+pub fn invoice_priority_set(
+    env: &Env,
+    invoice_id: u64,
+    set_by: &Address,
+    old_score: Option<u32>,
+    new_score: u32,
+    tier: u32,
+) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pri_set"), invoice_id),
+        (set_by.clone(), old_score, new_score, tier, event_seq),
+    );
+}
+
+/// Issue #918: Emitted when an invoice's priority is cleared.
+/// Topics: (split, pri_clr, invoice_id)
+/// Data: (cleared_by, event_seq)
+pub fn invoice_priority_cleared(env: &Env, invoice_id: u64, cleared_by: &Address) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pri_clr"), invoice_id),
+        (cleared_by.clone(), event_seq),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
