@@ -365,6 +365,16 @@ pub fn invoice_cloned(env: &Env, source_id: u64, new_id: u64) {
     );
 }
 
+/// Issue #926: Emitted when an invoice is partially cloned.
+/// Topics: (split, part_cln, source_id)
+/// Data: (new_id, recipient_count)
+pub fn invoice_partially_cloned(env: &Env, source_id: u64, new_id: u64, recipient_count: u32) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("part_cln"), source_id),
+        (new_id, recipient_count),
+    );
+}
+
 /// Emitted when an invoice is paused.
 /// Topics: (split, paused, invoice_id)
 /// Data: (creator, reason, auto_resume_at)

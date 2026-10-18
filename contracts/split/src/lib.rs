@@ -88,7 +88,7 @@ const MAX_PARENT_DEPTH: u32 = 10;
 
 use types::{
     AdminAction, AdminRole, AdminSet, AuditEntry, Bid, CircuitBreakerStatus,
-    CloneOverrides, CompactInvoice, CompactMigrateResult, CompletionProof, ComputeEstimate,
+    CloneOverrides, CloneRecord, CompactInvoice, CompactMigrateResult, CompletionProof, ComputeEstimate,
     ConfidentialPayment, ContributionResult, CreateInvoiceParams, CreatorStats, DelayedPayout,
     DisputeOutcome, DisputeRecord, DisputeStatus, FeeBracket, FeeSplit, FeeTier, InstalmentPlan,
     Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceExt3, InvoiceHot, InvoiceOptions,
@@ -6366,6 +6366,55 @@ impl SplitContract {
         source_id: u64,
         overrides: CloneOverrides,
     ) -> u64 {
+        Self::clone_invoice_impl(&env, creator, source_id, overrides, None)
+    }
+
+    /// Issue #926: Partially clone an invoice, copying only the recipients at
+    /// `recipient_indices` (and their amounts / per-recipient settings).
+    ///
+    /// `overrides.new_recipients` must be `None` — the recipient set is chosen
+    /// by index. `overrides.new_amounts`, when set, must have one entry per
+    /// selected index. Every other override applies as in [`clone_invoice`].
+    ///
+    /// Panics with "empty clone selection" if no index is given,
+    /// "clone index out of range" for an index past the source recipients,
+    /// and "duplicate clone index" if an index repeats.
+    pub fn clone_invoice_partial(
+        env: Env,
+        creator: Address,
+        source_id: u64,
+        recipient_indices: Vec<u32>,
+        overrides: CloneOverrides,
+    ) -> u64 {
+        assert!(
+            overrides.new_recipients.is_none(),
+            "recipients override not allowed in partial clone"
+        );
+        Self::clone_invoice_impl(&env, creator, source_id, overrides, Some(recipient_indices))
+    }
+
+    /// Issue #926: Audit record for a cloned invoice, if `clone_id` was
+    /// produced by `clone_invoice` / `clone_invoice_partial`.
+    pub fn get_clone_record(env: Env, clone_id: u64) -> Option<CloneRecord> {
+        env.storage().persistent().get(&clone_record_key(clone_id))
+    }
+
+    /// Issue #926: Every clone made from `source_id`, oldest first.
+    pub fn get_clone_history(env: Env, source_id: u64) -> Vec<CloneRecord> {
+        env.storage()
+            .persistent()
+            .get(&clone_history_key(source_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn clone_invoice_impl(
+        env: &Env,
+        creator: Address,
+        source_id: u64,
+        overrides: CloneOverrides,
+        recipient_indices: Option<Vec<u32>>,
+    ) -> u64 {
+        let env = env.clone();
         require_not_paused(&env);
         creator.require_auth();
 
@@ -6374,13 +6423,96 @@ impl SplitContract {
         assert!(source.creator == creator, "not invoice creator");
         assert!(source.clone_depth < 5, "max clone depth exceeded");
 
-        let recipients = overrides
-            .new_recipients
-            .unwrap_or_else(|| source.recipients.clone());
-        let amounts = overrides
-            .new_amounts
-            .unwrap_or_else(|| source.amounts.clone());
+        // Track which fields were modified for the audit record.
+        let mut modified_fields: Vec<Symbol> = Vec::new(&env);
+        if overrides.new_recipients.is_some() {
+            modified_fields.push_back(symbol_short!("recipient"));
+        }
+        if overrides.new_amounts.is_some() {
+            modified_fields.push_back(symbol_short!("amounts"));
+        }
+        if overrides.new_deadline.is_some() {
+            modified_fields.push_back(symbol_short!("deadline"));
+        }
+        if overrides.new_overflow_behavior.is_some() {
+            modified_fields.push_back(symbol_short!("overflow"));
+        }
+        if overrides.new_metadata_hash.is_some() {
+            modified_fields.push_back(symbol_short!("metadata"));
+        }
+
+        let source_len = source.recipients.len();
+        let partial = recipient_indices.is_some();
+        let indices: Vec<u32> = match recipient_indices {
+            Some(indices) => {
+                assert!(!indices.is_empty(), "empty clone selection");
+                for i in 0..indices.len() {
+                    let idx = indices.get(i).unwrap();
+                    assert!(idx < source_len, "clone index out of range");
+                    for j in (i + 1)..indices.len() {
+                        assert!(indices.get(j).unwrap() != idx, "duplicate clone index");
+                    }
+                }
+                indices
+            }
+            None => Vec::new(&env),
+        };
+
+        let recipients = if partial {
+            select_by_indices(&env, &source.recipients, &indices)
+        } else {
+            overrides
+                .new_recipients
+                .unwrap_or_else(|| source.recipients.clone())
+        };
+        let amounts = match overrides.new_amounts {
+            Some(amounts) => amounts,
+            None if partial => select_by_indices(&env, &source.amounts, &indices),
+            None => source.amounts.clone(),
+        };
         let deadline = overrides.new_deadline.unwrap_or(source.deadline);
+
+        validate_cloned_state(&env, &recipients, &amounts, deadline);
+
+        // Per-recipient parallel settings follow the selected recipients. When
+        // the recipient set changes shape they can no longer line up, so they
+        // are cleared rather than copied misaligned.
+        let new_len = recipients.len();
+        let swap_tokens = if partial && source.swap_tokens.len() == source_len {
+            select_by_indices(&env, &source.swap_tokens, &indices)
+        } else if source.swap_tokens.len() == new_len {
+            source.swap_tokens.clone()
+        } else {
+            Vec::new(&env)
+        };
+        let split_rules = if partial && source.split_rules.len() == source_len {
+            select_by_indices(&env, &source.split_rules, &indices)
+        } else if source.split_rules.len() == new_len {
+            source.split_rules.clone()
+        } else {
+            Vec::new(&env)
+        };
+        let priorities = if partial && source.priorities.len() == source_len {
+            select_by_indices(&env, &source.priorities, &indices)
+        } else if source.priorities.len() == new_len {
+            source.priorities.clone()
+        } else {
+            Vec::new(&env)
+        };
+        let recipient_max_payouts =
+            if partial && source.recipient_max_payouts.len() == source_len {
+                select_by_indices(&env, &source.recipient_max_payouts, &indices)
+            } else if source.recipient_max_payouts.len() == new_len {
+                source.recipient_max_payouts.clone()
+            } else {
+                Vec::new(&env)
+            };
+        // Ratios must sum to 10 000, so a subset can never stay valid.
+        let ratios = if !partial && source.ratios.len() == new_len {
+            source.ratios.clone()
+        } else {
+            Vec::new(&env)
+        };
         let overflow_behavior = overrides
             .new_overflow_behavior
             .map(|sym| {
@@ -6448,21 +6580,23 @@ impl SplitContract {
             tranches: source.tranches.clone(),
             co_signers: source.co_signers.clone(),
             required_signatures: source.required_signatures,
-            signatures: source.signatures.clone(),
+            // Approval / progress state belongs to the source invoice and
+            // must not carry over into a fresh clone.
+            signatures: Vec::new(&env),
             approver: source.approver.clone(),
-            approved: source.approved,
+            approved: false,
             condition_oracle: source.condition_oracle.clone(),
-            condition_met: source.condition_met,
+            condition_met: false,
             penalty_bps: source.penalty_bps,
             penalty_deadline: source.penalty_deadline,
             penalty_tiers: source.penalty_tiers.clone(),
             allowed_callers: source.allowed_callers.clone(),
             min_funding_bps: source.min_funding_bps,
             release_stages: source.release_stages.clone(),
-            released_stages: source.released_stages,
+            released_stages: 0,
             allowed_payers: source.allowed_payers.clone(),
             price_oracle: source.price_oracle.clone(),
-            swap_tokens: source.swap_tokens.clone(),
+            swap_tokens,
             tax_bps: source.tax_bps,
             tax_authority: source.tax_authority.clone(),
             insurance_premium_bps: source.insurance_premium_bps,
@@ -6472,7 +6606,7 @@ impl SplitContract {
             accepted_tokens: source.accepted_tokens.clone(),
             forward_to: source.forward_to.clone(),
             forward_invoice_id: source.forward_invoice_id,
-            split_rules: source.split_rules.clone(),
+            split_rules,
             auto_resolve_rules: source.auto_resolve_rules.clone(),
             creator_cosigner: source.creator_cosigner.clone(),
             velocity_limit: source.velocity_limit,
@@ -6496,7 +6630,7 @@ impl SplitContract {
             disputed: false,
             admin_frozen: false,
             scheduled_release_at: source.scheduled_release_at,
-            priorities: source.priorities.clone(),
+            priorities,
             target_usd_cents: source.target_usd_cents,
             refunded_addresses: Vec::new(&env),
             oracle: source.oracle.clone(),
@@ -6507,7 +6641,7 @@ impl SplitContract {
             held_until: None,
             milestones: source.milestones.clone(),
             milestones_released: 0,
-            recipient_max_payouts: source.recipient_max_payouts.clone(),
+            recipient_max_payouts,
             twafr_numerator: 0,
             twafr_last_ledger: 0,
             release_condition_hash: source.release_condition_hash.clone(),
@@ -6521,7 +6655,7 @@ impl SplitContract {
             early_bird_fee_credit: 0,
             creator_fee_bps: source.creator_fee_bps,
             ratio_denominator: source.ratio_denominator,
-            ratios: source.ratios.clone(),
+            ratios,
             metadata_hash: source.metadata_hash.clone(),
         };
 
@@ -6530,6 +6664,33 @@ impl SplitContract {
             env.storage().persistent().set(&metadata_hash_key(id), &hash);
         }
         events::invoice_cloned(&env, source_id, id);
+
+        // Issue #926: audit trail for the clone on both sides of the lineage.
+        append_audit_entry(&env, source_id, symbol_short!("cloned_to"), &creator);
+        append_audit_entry(&env, id, symbol_short!("cloned_fr"), &creator);
+        let record = CloneRecord {
+            source_id,
+            clone_id: id,
+            creator: creator.clone(),
+            partial,
+            recipient_indices: indices.clone(),
+            modified_fields,
+            cloned_at: env.ledger().timestamp(),
+            ledger: env.ledger().sequence(),
+        };
+        env.storage().persistent().set(&clone_record_key(id), &record);
+        let mut history: Vec<CloneRecord> = env
+            .storage()
+            .persistent()
+            .get(&clone_history_key(source_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        history.push_back(record);
+        env.storage()
+            .persistent()
+            .set(&clone_history_key(source_id), &history);
+        if partial {
+            events::invoice_partially_cloned(&env, source_id, id, indices.len());
+        }
 
         // Index each recipient -> invoice ID.
         for recipient in recipients.iter() {
@@ -14961,6 +15122,51 @@ impl SplitContract {
 #[allow(dead_code)]
 fn transfer_audit_key(invoice_id: u64) -> (Symbol, u64) {
     (symbol_short!("audit_log"), invoice_id)
+}
+
+fn clone_record_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("clone_rec"), id)
+}
+
+fn clone_history_key(source_id: u64) -> (Symbol, u64) {
+    (symbol_short!("clone_his"), source_id)
+}
+
+/// Issue #926: copy the entries of `src` at `indices`, in index order.
+fn select_by_indices<T>(env: &Env, src: &Vec<T>, indices: &Vec<u32>) -> Vec<T>
+where
+    T: IntoVal<Env, Val> + TryFromVal<Env, Val>,
+{
+    let mut out: Vec<T> = Vec::new(env);
+    for idx in indices.iter() {
+        if let Some(item) = src.get(idx) {
+            out.push_back(item);
+        }
+    }
+    out
+}
+
+/// Issue #926: reject a clone whose resulting state could not have been
+/// created through `create_invoice`.
+fn validate_cloned_state(env: &Env, recipients: &Vec<Address>, amounts: &Vec<i128>, deadline: u64) {
+    assert!(!recipients.is_empty(), "clone has no recipients");
+    assert!(
+        recipients.len() == amounts.len(),
+        "clone recipients and amounts length mismatch"
+    );
+    for amount in amounts.iter() {
+        assert!(amount > 0, "clone amount must be positive");
+    }
+    for i in 0..recipients.len() {
+        let r = recipients.get(i).unwrap();
+        for j in (i + 1)..recipients.len() {
+            assert!(recipients.get(j).unwrap() != r, "duplicate clone recipient");
+        }
+    }
+    assert!(
+        deadline > env.ledger().timestamp(),
+        "clone deadline must be in the future"
+    );
 }
 
 fn archived_key(id: u64) -> (Symbol, u64) {

@@ -1883,6 +1883,23 @@ pub struct PaymentRecord {
 }
 
 
+/// Issue #926: Audit record written every time an invoice is cloned.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CloneRecord {
+    pub source_id: u64,
+    pub clone_id: u64,
+    pub creator: Address,
+    /// True when produced by `clone_invoice_partial`.
+    pub partial: bool,
+    /// Source recipient indices copied (empty for a full clone).
+    pub recipient_indices: Vec<u32>,
+    /// Fields changed through `CloneOverrides`.
+    pub modified_fields: Vec<Symbol>,
+    pub cloned_at: u64,
+    pub ledger: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::InvoiceStatus;
