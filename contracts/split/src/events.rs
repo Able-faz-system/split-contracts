@@ -1983,6 +1983,49 @@ pub fn creator_fee_tier_changed(
     );
 }
 
+// ---------------------------------------------------------------------------
+// Issue #920: Invoice metadata storage
+// ---------------------------------------------------------------------------
+
+/// Issue #920: Emitted when a metadata entry is created or overwritten.
+/// Topics: (split, meta_set, invoice_id)
+/// Data: (key, version, updated_by, event_seq)
+pub fn invoice_metadata_set(
+    env: &Env,
+    invoice_id: u64,
+    key: &String,
+    version: u32,
+    updated_by: &Address,
+) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("meta_set"), invoice_id),
+        (key.clone(), version, updated_by.clone(), event_seq),
+    );
+}
+
+/// Issue #920: Emitted when a metadata entry is removed.
+/// Topics: (split, meta_del, invoice_id)
+/// Data: (key, removed_by, event_seq)
+pub fn invoice_metadata_removed(env: &Env, invoice_id: u64, key: &String, removed_by: &Address) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("meta_del"), invoice_id),
+        (key.clone(), removed_by.clone(), event_seq),
+    );
+}
+
+/// Issue #920: Emitted when an invoice's metadata is permanently locked.
+/// Topics: (split, meta_lck, invoice_id)
+/// Data: (locked_by, event_seq)
+pub fn invoice_metadata_locked(env: &Env, invoice_id: u64, locked_by: &Address) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("meta_lck"), invoice_id),
+        (locked_by.clone(), event_seq),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

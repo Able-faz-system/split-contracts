@@ -75,6 +75,7 @@ mod migrations;
 
 mod priority;
 mod creator_fee_tiers;
+mod invoice_metadata;
 
 use error::ContractError;
 use validation::assert_valid_bps;
