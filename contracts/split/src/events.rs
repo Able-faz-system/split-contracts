@@ -2026,6 +2026,39 @@ pub fn invoice_metadata_locked(env: &Env, invoice_id: u64, locked_by: &Address) 
     );
 }
 
+// ---------------------------------------------------------------------------
+// Issue #921: Confidential payment tracking
+// ---------------------------------------------------------------------------
+
+/// Issue #921: Emitted when a confidential payment is recorded or replaced.
+/// Carries only a digest of the commitment — never an amount.
+/// Topics: (split, ctrk_rec, invoice_id)
+/// Data: (payer, commitment_digest, revision, event_seq)
+pub fn confidential_payment_recorded(
+    env: &Env,
+    invoice_id: u64,
+    payer: &Address,
+    commitment_digest: &BytesN<32>,
+    revision: u32,
+) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("ctrk_rec"), invoice_id),
+        (payer.clone(), commitment_digest.clone(), revision, event_seq),
+    );
+}
+
+/// Issue #921: Emitted when the creator proves the confidential invoice total.
+/// Topics: (split, ctrk_ver, invoice_id)
+/// Data: (verified_by, total, event_seq)
+pub fn confidential_total_verified(env: &Env, invoice_id: u64, verified_by: &Address, total: i128) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("ctrk_ver"), invoice_id),
+        (verified_by.clone(), total, event_seq),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
