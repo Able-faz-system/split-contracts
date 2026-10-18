@@ -94,10 +94,10 @@ use types::{
     DisputeOutcome, DisputeRecord, DisputeStatus, FeeBracket, FeeSplit, FeeTier, InstalmentPlan,
     Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceExt3, InvoiceHot, InvoiceOptions,
     InvoiceOptions2, InvoicePayment, InvoiceStats, InvoiceStatus, InvoiceTemplate,
-    InvoiceTemplateRecord, LegacyInvoice, RecipientAuth, RecipientAuthLogEntry, RecipientAuthStatus, OverflowBehavior, OverfundingPolicy, Payment,
+    InvoiceTemplateRecord, LegacyInvoice, OperationSnapshot, RecipientAuth, RecipientAuthLogEntry, RecipientAuthStatus, OverflowBehavior, OverfundingPolicy, Payment,
     PaymentCertificate, PaymentCommitment, PaymentProof, PaymentRecord, PendingAdminAction,
     ProtocolFeeConfig, QueuedAction, RebateTier, Recipient, RepScore, ResolveAction,
-    ResolveRule, Role, SimulateReleaseResult, SplitRule, SubscriptionParams, TimelockAction,
+    ResolveRule, ReversibleOp, ReversibleOpKind, ReversibleOpStatus, Role, SimulateReleaseResult, SplitRule, SubscriptionParams, TimelockAction,
     Tombstone, Tranche, TransferRecord, TreasuryRecord, UpgradeProposal,
 };
 
@@ -15398,6 +15398,98 @@ fn recipient_challenge_response(env: &Env, challenge: &BytesN<32>, recipient: &A
     env.crypto().sha256(&preimage).into()
 }
 
+/// Issue #929: default undo window for reversible operations (1 hour).
+const DEFAULT_ROLLBACK_WINDOW_SECS: u64 = 3_600;
+const MIN_ROLLBACK_WINDOW_SECS: u64 = 60;
+const MAX_ROLLBACK_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+
+fn rollback_window_key() -> Symbol {
+    symbol_short!("rb_window")
+}
+
+fn rollback_counter_key() -> Symbol {
+    symbol_short!("rb_ctr")
+}
+
+fn reversible_op_key(op_id: u64) -> (Symbol, u64) {
+    (symbol_short!("rb_op"), op_id)
+}
+
+fn invoice_ops_key(invoice_id: u64) -> (Symbol, u64) {
+    (symbol_short!("rb_ops"), invoice_id)
+}
+
+fn get_rollback_window_secs(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&rollback_window_key())
+        .unwrap_or(DEFAULT_ROLLBACK_WINDOW_SECS)
+}
+
+/// Issue #929: capture the invoice fields a reversible operation may touch.
+fn snapshot_operation_state(invoice: &Invoice) -> OperationSnapshot {
+    OperationSnapshot {
+        deadline: invoice.deadline,
+        amounts: invoice.amounts.clone(),
+        base_amounts: invoice.base_amounts.clone(),
+        status: invoice.status.clone(),
+        funded: invoice.funded,
+        payment_count: invoice.payments.len(),
+    }
+}
+
+fn hash_operation_snapshot(env: &Env, snapshot: &OperationSnapshot) -> BytesN<32> {
+    env.crypto().sha256(&snapshot.clone().to_xdr(env)).into()
+}
+
+/// Issue #929: apply a reversible mutation to `invoice` and record it.
+///
+/// `before` is the snapshot taken prior to the mutation; the post-mutation
+/// snapshot hash is stored so `undo_operation` can detect any later change.
+fn record_reversible_op(
+    env: &Env,
+    invoice_id: u64,
+    invoice: &Invoice,
+    kind: ReversibleOpKind,
+    actor: &Address,
+    before: OperationSnapshot,
+) -> u64 {
+    let op_id: u64 = env
+        .storage()
+        .instance()
+        .get(&rollback_counter_key())
+        .unwrap_or(0u64)
+        + 1;
+    env.storage().instance().set(&rollback_counter_key(), &op_id);
+
+    let now = env.ledger().timestamp();
+    let after_hash = hash_operation_snapshot(env, &snapshot_operation_state(invoice));
+    let op = ReversibleOp {
+        op_id,
+        invoice_id,
+        kind: kind.clone(),
+        actor: actor.clone(),
+        before,
+        after_hash,
+        created_at: now,
+        expires_at: now.saturating_add(get_rollback_window_secs(env)),
+        status: ReversibleOpStatus::Recorded,
+        undone_at: None,
+    };
+    env.storage().persistent().set(&reversible_op_key(op_id), &op);
+
+    let mut ops: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&invoice_ops_key(invoice_id))
+        .unwrap_or_else(|| Vec::new(env));
+    ops.push_back(op_id);
+    env.storage().persistent().set(&invoice_ops_key(invoice_id), &ops);
+
+    events::reversible_op_recorded(env, invoice_id, op_id, kind);
+    op_id
+}
+
 fn clone_record_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("clone_rec"), id)
 }
@@ -16741,5 +16833,163 @@ impl SplitContract {
         recipient: Address,
     ) -> BytesN<32> {
         recipient_challenge_response(&env, &challenge, &recipient)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #929: Reversible operations (undo / rollback within a time window)
+// ---------------------------------------------------------------------------
+
+#[contractimpl]
+impl SplitContract {
+    /// Set the undo window for reversible operations, in seconds.
+    /// Operator role or higher. Applies to operations recorded afterwards.
+    pub fn set_rollback_window(env: Env, admin: Address, window_secs: u64) {
+        require_admin_role(&env, &admin, AdminRole::Operator);
+        assert!(
+            window_secs >= MIN_ROLLBACK_WINDOW_SECS && window_secs <= MAX_ROLLBACK_WINDOW_SECS,
+            "invalid rollback window"
+        );
+        env.storage().instance().set(&rollback_window_key(), &window_secs);
+    }
+
+    /// Current undo window for reversible operations, in seconds.
+    pub fn get_rollback_window(env: Env) -> u64 {
+        get_rollback_window_secs(&env)
+    }
+
+    /// Change a Pending invoice's deadline, recording an undoable operation.
+    /// Creator or co-creator only. Returns the operation ID.
+    pub fn reversible_update_deadline(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        new_deadline: u64,
+    ) -> u64 {
+        require_not_paused(&env);
+        caller.require_auth();
+        let mut invoice = load_invoice(&env, invoice_id);
+        require_creator_or_cocreator(&invoice, &caller);
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice not pending");
+        assert!(new_deadline > env.ledger().timestamp(), "deadline must be in the future");
+
+        let before = snapshot_operation_state(&invoice);
+        invoice.deadline = new_deadline;
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("rv_dline"), &caller);
+        record_reversible_op(&env, invoice_id, &invoice, ReversibleOpKind::UpdateDeadline, &caller, before)
+    }
+
+    /// Change the recipient amounts of an unfunded Pending invoice, recording
+    /// an undoable operation. Creator or co-creator only.
+    pub fn reversible_update_amounts(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        new_amounts: Vec<i128>,
+    ) -> u64 {
+        require_not_paused(&env);
+        caller.require_auth();
+        let mut invoice = load_invoice(&env, invoice_id);
+        require_creator_or_cocreator(&invoice, &caller);
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice not pending");
+        assert!(invoice.funded == 0, "invoice already funded");
+        assert!(
+            new_amounts.len() == invoice.recipients.len(),
+            "amounts length mismatch"
+        );
+        for amount in new_amounts.iter() {
+            assert!(amount > 0, "amount must be positive");
+        }
+
+        let before = snapshot_operation_state(&invoice);
+        invoice.amounts = new_amounts.clone();
+        invoice.base_amounts = new_amounts;
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("rv_amts"), &caller);
+        record_reversible_op(&env, invoice_id, &invoice, ReversibleOpKind::UpdateAmounts, &caller, before)
+    }
+
+    /// Cancel an unfunded Pending invoice, recording an undoable operation.
+    /// Creator or co-creator only. No funds move, so undo is always safe
+    /// within the window.
+    pub fn reversible_cancel_invoice(env: Env, caller: Address, invoice_id: u64) -> u64 {
+        require_not_paused(&env);
+        caller.require_auth();
+        let mut invoice = load_invoice(&env, invoice_id);
+        require_creator_or_cocreator(&invoice, &caller);
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice not pending");
+        assert!(invoice.funded == 0, "invoice already funded");
+
+        let before = snapshot_operation_state(&invoice);
+        invoice.status = InvoiceStatus::Cancelled;
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("rv_cancel"), &caller);
+        record_reversible_op(&env, invoice_id, &invoice, ReversibleOpKind::Cancel, &caller, before)
+    }
+
+    /// Undo a recorded operation, restoring the invoice's pre-operation state.
+    ///
+    /// Callable by the operation's actor or the invoice creator, within the
+    /// rollback window. Rejected if the invoice has changed in any tracked
+    /// field since the operation (including a later reversible operation —
+    /// undo those first, most recent first).
+    pub fn undo_operation(env: Env, caller: Address, op_id: u64) {
+        require_not_paused(&env);
+        caller.require_auth();
+        let mut op: ReversibleOp = env
+            .storage()
+            .persistent()
+            .get(&reversible_op_key(op_id))
+            .expect("operation not found");
+        assert!(op.status == ReversibleOpStatus::Recorded, "operation not undoable");
+        assert!(env.ledger().timestamp() <= op.expires_at, "rollback window elapsed");
+
+        let mut invoice = load_invoice(&env, op.invoice_id);
+        assert!(
+            caller == op.actor || caller == invoice.creator,
+            "not authorized to undo"
+        );
+        let current_hash = hash_operation_snapshot(&env, &snapshot_operation_state(&invoice));
+        assert!(current_hash == op.after_hash, "invoice changed since operation");
+        assert!(
+            op.before.amounts.len() == invoice.recipients.len(),
+            "snapshot inconsistent with invoice"
+        );
+
+        invoice.deadline = op.before.deadline;
+        invoice.amounts = op.before.amounts.clone();
+        invoice.base_amounts = op.before.base_amounts.clone();
+        invoice.status = op.before.status.clone();
+        save_invoice(&env, op.invoice_id, &invoice);
+
+        op.status = ReversibleOpStatus::Undone;
+        op.undone_at = Some(env.ledger().timestamp());
+        env.storage().persistent().set(&reversible_op_key(op_id), &op);
+
+        append_audit_entry(&env, op.invoice_id, symbol_short!("rv_undo"), &caller);
+        events::reversible_op_undone(&env, op.invoice_id, op_id, &caller);
+    }
+
+    /// Fetch a reversible operation. A `Recorded` operation past its window
+    /// is reported as `Expired`.
+    pub fn get_operation(env: Env, op_id: u64) -> ReversibleOp {
+        let mut op: ReversibleOp = env
+            .storage()
+            .persistent()
+            .get(&reversible_op_key(op_id))
+            .expect("operation not found");
+        if op.status == ReversibleOpStatus::Recorded && env.ledger().timestamp() > op.expires_at {
+            op.status = ReversibleOpStatus::Expired;
+        }
+        op
+    }
+
+    /// IDs of every reversible operation recorded on `invoice_id`, oldest first.
+    pub fn get_invoice_operations(env: Env, invoice_id: u64) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&invoice_ops_key(invoice_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }

@@ -425,6 +425,26 @@ pub fn recipient_auth_changed(env: &Env, invoice_id: u64, recipient: &Address, a
     );
 }
 
+/// Issue #929: Emitted when a reversible operation is recorded.
+/// Topics: (split, rv_rec, invoice_id)
+/// Data: (op_id, kind)
+pub fn reversible_op_recorded(env: &Env, invoice_id: u64, op_id: u64, kind: crate::types::ReversibleOpKind) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("rv_rec"), invoice_id),
+        (op_id, kind),
+    );
+}
+
+/// Issue #929: Emitted when a reversible operation is undone.
+/// Topics: (split, rv_undo, invoice_id)
+/// Data: (op_id, caller, ledger)
+pub fn reversible_op_undone(env: &Env, invoice_id: u64, op_id: u64, caller: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("rv_undo"), invoice_id),
+        (op_id, caller.clone(), env.ledger().sequence()),
+    );
+}
+
 /// Emitted when an invoice is paused.
 /// Topics: (split, paused, invoice_id)
 /// Data: (creator, reason, auto_resume_at)

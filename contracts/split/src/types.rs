@@ -2004,6 +2004,56 @@ pub struct RecipientAuthLogEntry {
     pub ledger: u32,
 }
 
+/// Issue #929: Kind of reversible operation.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReversibleOpKind {
+    UpdateDeadline,
+    UpdateAmounts,
+    Cancel,
+}
+
+/// Issue #929: Rollback state machine — `Recorded` → `Undone`, or
+/// `Recorded` → `Expired` once the window elapses.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReversibleOpStatus {
+    Recorded,
+    Undone,
+    Expired,
+}
+
+/// Issue #929: Invoice fields captured before a reversible operation.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct OperationSnapshot {
+    pub deadline: u64,
+    pub amounts: Vec<i128>,
+    pub base_amounts: Vec<i128>,
+    pub status: InvoiceStatus,
+    pub funded: i128,
+    pub payment_count: u32,
+}
+
+/// Issue #929: A recorded, potentially undoable operation.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ReversibleOp {
+    pub op_id: u64,
+    pub invoice_id: u64,
+    pub kind: ReversibleOpKind,
+    pub actor: Address,
+    /// State to restore on undo.
+    pub before: OperationSnapshot,
+    /// Hash of the state right after the operation; undo requires the
+    /// invoice to still match it.
+    pub after_hash: BytesN<32>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub status: ReversibleOpStatus,
+    pub undone_at: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::InvoiceStatus;
