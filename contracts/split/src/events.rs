@@ -1918,6 +1918,147 @@ pub fn deadline_extended(env: &Env, invoice_id: u64, old_deadline: u64, new_dead
 // Unit tests for the per-invoice event sequence counter (issue #708)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Issue #918: Invoice prioritization
+// ---------------------------------------------------------------------------
+
+/// Issue #918: Emitted when an invoice's priority is set or updated.
+/// Topics: (split, pri_set, invoice_id)
+/// Data: (set_by, old_score, new_score, tier, event_seq)
+pub fn invoice_priority_set(
+    env: &Env,
+    invoice_id: u64,
+    set_by: &Address,
+    old_score: Option<u32>,
+    new_score: u32,
+    tier: u32,
+) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pri_set"), invoice_id),
+        (set_by.clone(), old_score, new_score, tier, event_seq),
+    );
+}
+
+/// Issue #918: Emitted when an invoice's priority is cleared.
+/// Topics: (split, pri_clr, invoice_id)
+/// Data: (cleared_by, event_seq)
+pub fn invoice_priority_cleared(env: &Env, invoice_id: u64, cleared_by: &Address) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pri_clr"), invoice_id),
+        (cleared_by.clone(), event_seq),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #919: Creator fee tier system
+// ---------------------------------------------------------------------------
+
+/// Issue #919: Emitted when the creator fee tier table is replaced, updated or
+/// cleared (`version == 0`, `tier_count == 0` on clear).
+/// Topics: (split, cfee_cfg)
+/// Data: (version, tier_count)
+pub fn creator_fee_tiers_configured(env: &Env, version: u32, tier_count: u32) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("cfee_cfg")),
+        (version, tier_count),
+    );
+}
+
+/// Issue #919: Emitted when a creator's tracked fee tier changes.
+/// Topics: (split, cfee_chg, creator)
+/// Data: (old_tier_id, new_tier_id, fee_bps, volume)
+pub fn creator_fee_tier_changed(
+    env: &Env,
+    creator: &Address,
+    old_tier_id: Option<u32>,
+    new_tier_id: u32,
+    fee_bps: u32,
+    volume: i128,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("cfee_chg"), creator.clone()),
+        (old_tier_id, new_tier_id, fee_bps, volume),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #920: Invoice metadata storage
+// ---------------------------------------------------------------------------
+
+/// Issue #920: Emitted when a metadata entry is created or overwritten.
+/// Topics: (split, meta_set, invoice_id)
+/// Data: (key, version, updated_by, event_seq)
+pub fn invoice_metadata_set(
+    env: &Env,
+    invoice_id: u64,
+    key: &String,
+    version: u32,
+    updated_by: &Address,
+) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("meta_set"), invoice_id),
+        (key.clone(), version, updated_by.clone(), event_seq),
+    );
+}
+
+/// Issue #920: Emitted when a metadata entry is removed.
+/// Topics: (split, meta_del, invoice_id)
+/// Data: (key, removed_by, event_seq)
+pub fn invoice_metadata_removed(env: &Env, invoice_id: u64, key: &String, removed_by: &Address) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("meta_del"), invoice_id),
+        (key.clone(), removed_by.clone(), event_seq),
+    );
+}
+
+/// Issue #920: Emitted when an invoice's metadata is permanently locked.
+/// Topics: (split, meta_lck, invoice_id)
+/// Data: (locked_by, event_seq)
+pub fn invoice_metadata_locked(env: &Env, invoice_id: u64, locked_by: &Address) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("meta_lck"), invoice_id),
+        (locked_by.clone(), event_seq),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #921: Confidential payment tracking
+// ---------------------------------------------------------------------------
+
+/// Issue #921: Emitted when a confidential payment is recorded or replaced.
+/// Carries only a digest of the commitment — never an amount.
+/// Topics: (split, ctrk_rec, invoice_id)
+/// Data: (payer, commitment_digest, revision, event_seq)
+pub fn confidential_payment_recorded(
+    env: &Env,
+    invoice_id: u64,
+    payer: &Address,
+    commitment_digest: &BytesN<32>,
+    revision: u32,
+) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("ctrk_rec"), invoice_id),
+        (payer.clone(), commitment_digest.clone(), revision, event_seq),
+    );
+}
+
+/// Issue #921: Emitted when the creator proves the confidential invoice total.
+/// Topics: (split, ctrk_ver, invoice_id)
+/// Data: (verified_by, total, event_seq)
+pub fn confidential_total_verified(env: &Env, invoice_id: u64, verified_by: &Address, total: i128) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("ctrk_ver"), invoice_id),
+        (verified_by.clone(), total, event_seq),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
