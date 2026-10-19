@@ -2083,6 +2083,177 @@ pub struct PaymentRecord {
 }
 
 
+/// Issue #926: Audit record written every time an invoice is cloned.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CloneRecord {
+    pub source_id: u64,
+    pub clone_id: u64,
+    pub creator: Address,
+    /// True when produced by `clone_invoice_partial`.
+    pub partial: bool,
+    /// Source recipient indices copied (empty for a full clone).
+    pub recipient_indices: Vec<u32>,
+    /// Fields changed through `CloneOverrides`.
+    pub modified_fields: Vec<Symbol>,
+    pub cloned_at: u64,
+    pub ledger: u32,
+}
+
+/// Issue #927: Lifecycle of an invoice with respect to archival.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ArchivalStatus {
+    /// Never archived — lives in persistent storage.
+    Active,
+    /// Moved to cold (instance) storage.
+    Archived,
+    /// Recovered from the archive back into persistent storage.
+    Restored,
+    /// Archived and cleaned up past the retention period (payments dropped).
+    Purged,
+}
+
+/// Issue #927: Per-invoice archival status tracking.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ArchivalRecord {
+    pub status: ArchivalStatus,
+    pub archived_at_ledger: u32,
+    /// `None` for lazy / explicit archival with no authenticated actor.
+    pub archived_by: Option<Address>,
+    pub restored_at_ledger: Option<u32>,
+    pub restored_by: Option<Address>,
+    pub purged_at_ledger: Option<u32>,
+    /// Number of times this invoice has been archived.
+    pub archive_count: u32,
+}
+
+/// Issue #927: Admin-configured archival schedule and cleanup policy.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ArchivalPolicy {
+    /// Whether `run_archival_sweep` may run.
+    pub enabled: bool,
+    /// Minimum ledgers between two sweeps.
+    pub sweep_interval_ledgers: u32,
+    /// Invoice IDs scanned per sweep (1–50).
+    pub max_batch: u32,
+    /// Ledgers an archived invoice is retained before it may be purged;
+    /// 0 disables purging.
+    pub retention_ledgers: u32,
+    /// Purge eligible invoices during sweeps.
+    pub auto_purge: bool,
+    /// Ledgers a restored invoice is exempt from re-archival.
+    pub restore_hold_ledgers: u32,
+}
+
+/// Issue #927: Aggregate archival counters.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ArchivalStats {
+    pub total_archived: u64,
+    pub total_restored: u64,
+    pub total_purged: u64,
+    pub last_sweep_ledger: u32,
+    /// Last invoice ID scanned by the sweep; wraps to 0 at the end.
+    pub sweep_cursor: u64,
+}
+
+/// Issue #928: State machine for recipient address verification.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RecipientAuthStatus {
+    Unverified,
+    /// A challenge is outstanding and awaiting the recipient's response.
+    ChallengeIssued,
+    Verified,
+    /// Too many incorrect responses; a new challenge is required.
+    Failed,
+    /// The challenge was not answered before `expires_at`.
+    Expired,
+    /// Verification was withdrawn by the creator.
+    Revoked,
+}
+
+/// Issue #928: Authentication record for one recipient of one invoice.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RecipientAuth {
+    pub invoice_id: u64,
+    pub recipient: Address,
+    pub status: RecipientAuthStatus,
+    /// Outstanding challenge; cleared once answered, expired or failed.
+    pub challenge: Option<BytesN<32>>,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub verified_at: Option<u64>,
+    /// Incorrect responses to the current challenge.
+    pub attempts: u32,
+    pub nonce: u64,
+}
+
+/// Issue #928: Entry in the per-invoice recipient verification audit log.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RecipientAuthLogEntry {
+    pub recipient: Address,
+    pub action: Symbol,
+    pub actor: Address,
+    pub timestamp: u64,
+    pub ledger: u32,
+}
+
+/// Issue #929: Kind of reversible operation.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReversibleOpKind {
+    UpdateDeadline,
+    UpdateAmounts,
+    Cancel,
+}
+
+/// Issue #929: Rollback state machine — `Recorded` → `Undone`, or
+/// `Recorded` → `Expired` once the window elapses.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReversibleOpStatus {
+    Recorded,
+    Undone,
+    Expired,
+}
+
+/// Issue #929: Invoice fields captured before a reversible operation.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct OperationSnapshot {
+    pub deadline: u64,
+    pub amounts: Vec<i128>,
+    pub base_amounts: Vec<i128>,
+    pub status: InvoiceStatus,
+    pub funded: i128,
+    pub payment_count: u32,
+}
+
+/// Issue #929: A recorded, potentially undoable operation.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ReversibleOp {
+    pub op_id: u64,
+    pub invoice_id: u64,
+    pub kind: ReversibleOpKind,
+    pub actor: Address,
+    /// State to restore on undo.
+    pub before: OperationSnapshot,
+    /// Hash of the state right after the operation; undo requires the
+    /// invoice to still match it.
+    pub after_hash: BytesN<32>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub status: ReversibleOpStatus,
+    pub undone_at: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::InvoiceStatus;

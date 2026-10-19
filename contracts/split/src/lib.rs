@@ -79,6 +79,10 @@ pub mod types;
 mod validation;
 mod calc;
 mod stats;
+pub mod security_audit;
+pub mod payment_tracking;
+pub mod velocity;
+pub mod split_rules;
 
 #[cfg(test)]
 mod test;
@@ -94,6 +98,11 @@ mod storage_keys;
 
 mod migrations;
 
+mod insurance_pool;
+mod sustainability;
+mod cooperative;
+mod education_lockup;
+
 use error::ContractError;
 use validation::assert_valid_bps;
 use calc::{calc_platform_fee, funding_bps};
@@ -108,20 +117,18 @@ use soroban_sdk::{
 const MAX_PARENT_DEPTH: u32 = 10;
 
 use types::{
-    AdminAction, AdminRole, AdminSet, AuditEntry, BatchExecutionReport, BatchingStats, Bid,
-    CircuitBreakerConfig, CircuitBreakerState,
-    CircuitBreakerStatus, CircuitBreakerTransition, CostEstimate, OperationCostModel,
-    OperationCostReport, OperationProfile,
-    CloneOverrides, CompactInvoice, CompactMigrateResult, CompletionProof, ComputeEstimate,
+    AdminAction, AdminRole, AdminSet, ArchivalPolicy, ArchivalRecord, ArchivalStats,
+    ArchivalStatus, AuditEntry, Bid, CircuitBreakerStatus,
+    CloneOverrides, CloneRecord, CompactInvoice, CompactMigrateResult, CompletionProof, ComputeEstimate,
     ConfidentialPayment, ContributionResult, CreateInvoiceParams, CreatorStats, DelayedPayout,
     DisputeOutcome, DisputeRecord, DisputeStatus, FeeBracket, FeeSplit, FeeTier, FeeWaiver,
     FeeWaiverAction, FeeWaiverAuditEntry, InstalmentPlan,
     Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceExt3, InvoiceHot, InvoiceOptions,
     InvoiceOptions2, InvoicePayment, InvoiceStats, InvoiceStatus, InvoiceTemplate,
-    InvoiceTemplateRecord, LegacyInvoice, OverflowBehavior, OverfundingPolicy, Payment,
-    PaymentBatch, PaymentBatchStatus, PaymentCertificate, PaymentCommitment, PaymentProof, PaymentRecord, PendingAdminAction,
+    InvoiceTemplateRecord, LegacyInvoice, OperationSnapshot, RecipientAuth, RecipientAuthLogEntry, RecipientAuthStatus, OverflowBehavior, OverfundingPolicy, Payment,
+    PaymentCertificate, PaymentCommitment, PaymentProof, PaymentRecord, PendingAdminAction,
     ProtocolFeeConfig, QueuedAction, RebateTier, Recipient, RepScore, ResolveAction,
-    ResolveRule, Role, SimulateReleaseResult, SplitRule, SubscriptionParams, TimelockAction,
+    ResolveRule, ReversibleOp, ReversibleOpKind, ReversibleOpStatus, Role, SimulateReleaseResult, SplitRule, SubscriptionParams, TimelockAction,
     Tombstone, Tranche, TransferRecord, TreasuryRecord, UpgradeProposal,
 };
 
@@ -1921,7 +1928,13 @@ fn maybe_archive_invoice(env: &Env, id: u64) {
         return;
     }
 
+    // Issue #927: a recently restored invoice is held out of lazy archival.
+    if in_restore_hold(env, id) {
+        return;
+    }
+
     archive_invoice_storage(env, id, &core);
+    record_archived(env, id, None);
     events::invoice_archived(env, id);
 }
 
@@ -6913,6 +6926,55 @@ impl SplitContract {
         source_id: u64,
         overrides: CloneOverrides,
     ) -> u64 {
+        Self::clone_invoice_impl(&env, creator, source_id, overrides, None)
+    }
+
+    /// Issue #926: Partially clone an invoice, copying only the recipients at
+    /// `recipient_indices` (and their amounts / per-recipient settings).
+    ///
+    /// `overrides.new_recipients` must be `None` — the recipient set is chosen
+    /// by index. `overrides.new_amounts`, when set, must have one entry per
+    /// selected index. Every other override applies as in [`clone_invoice`].
+    ///
+    /// Panics with "empty clone selection" if no index is given,
+    /// "clone index out of range" for an index past the source recipients,
+    /// and "duplicate clone index" if an index repeats.
+    pub fn clone_invoice_partial(
+        env: Env,
+        creator: Address,
+        source_id: u64,
+        recipient_indices: Vec<u32>,
+        overrides: CloneOverrides,
+    ) -> u64 {
+        assert!(
+            overrides.new_recipients.is_none(),
+            "recipients override not allowed in partial clone"
+        );
+        Self::clone_invoice_impl(&env, creator, source_id, overrides, Some(recipient_indices))
+    }
+
+    /// Issue #926: Audit record for a cloned invoice, if `clone_id` was
+    /// produced by `clone_invoice` / `clone_invoice_partial`.
+    pub fn get_clone_record(env: Env, clone_id: u64) -> Option<CloneRecord> {
+        env.storage().persistent().get(&clone_record_key(clone_id))
+    }
+
+    /// Issue #926: Every clone made from `source_id`, oldest first.
+    pub fn get_clone_history(env: Env, source_id: u64) -> Vec<CloneRecord> {
+        env.storage()
+            .persistent()
+            .get(&clone_history_key(source_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn clone_invoice_impl(
+        env: &Env,
+        creator: Address,
+        source_id: u64,
+        overrides: CloneOverrides,
+        recipient_indices: Option<Vec<u32>>,
+    ) -> u64 {
+        let env = env.clone();
         require_not_paused(&env);
         creator.require_auth();
 
@@ -6921,13 +6983,96 @@ impl SplitContract {
         assert!(source.creator == creator, "not invoice creator");
         assert!(source.clone_depth < 5, "max clone depth exceeded");
 
-        let recipients = overrides
-            .new_recipients
-            .unwrap_or_else(|| source.recipients.clone());
-        let amounts = overrides
-            .new_amounts
-            .unwrap_or_else(|| source.amounts.clone());
+        // Track which fields were modified for the audit record.
+        let mut modified_fields: Vec<Symbol> = Vec::new(&env);
+        if overrides.new_recipients.is_some() {
+            modified_fields.push_back(symbol_short!("recipient"));
+        }
+        if overrides.new_amounts.is_some() {
+            modified_fields.push_back(symbol_short!("amounts"));
+        }
+        if overrides.new_deadline.is_some() {
+            modified_fields.push_back(symbol_short!("deadline"));
+        }
+        if overrides.new_overflow_behavior.is_some() {
+            modified_fields.push_back(symbol_short!("overflow"));
+        }
+        if overrides.new_metadata_hash.is_some() {
+            modified_fields.push_back(symbol_short!("metadata"));
+        }
+
+        let source_len = source.recipients.len();
+        let partial = recipient_indices.is_some();
+        let indices: Vec<u32> = match recipient_indices {
+            Some(indices) => {
+                assert!(!indices.is_empty(), "empty clone selection");
+                for i in 0..indices.len() {
+                    let idx = indices.get(i).unwrap();
+                    assert!(idx < source_len, "clone index out of range");
+                    for j in (i + 1)..indices.len() {
+                        assert!(indices.get(j).unwrap() != idx, "duplicate clone index");
+                    }
+                }
+                indices
+            }
+            None => Vec::new(&env),
+        };
+
+        let recipients = if partial {
+            select_by_indices(&env, &source.recipients, &indices)
+        } else {
+            overrides
+                .new_recipients
+                .unwrap_or_else(|| source.recipients.clone())
+        };
+        let amounts = match overrides.new_amounts {
+            Some(amounts) => amounts,
+            None if partial => select_by_indices(&env, &source.amounts, &indices),
+            None => source.amounts.clone(),
+        };
         let deadline = overrides.new_deadline.unwrap_or(source.deadline);
+
+        validate_cloned_state(&env, &recipients, &amounts, deadline);
+
+        // Per-recipient parallel settings follow the selected recipients. When
+        // the recipient set changes shape they can no longer line up, so they
+        // are cleared rather than copied misaligned.
+        let new_len = recipients.len();
+        let swap_tokens = if partial && source.swap_tokens.len() == source_len {
+            select_by_indices(&env, &source.swap_tokens, &indices)
+        } else if source.swap_tokens.len() == new_len {
+            source.swap_tokens.clone()
+        } else {
+            Vec::new(&env)
+        };
+        let split_rules = if partial && source.split_rules.len() == source_len {
+            select_by_indices(&env, &source.split_rules, &indices)
+        } else if source.split_rules.len() == new_len {
+            source.split_rules.clone()
+        } else {
+            Vec::new(&env)
+        };
+        let priorities = if partial && source.priorities.len() == source_len {
+            select_by_indices(&env, &source.priorities, &indices)
+        } else if source.priorities.len() == new_len {
+            source.priorities.clone()
+        } else {
+            Vec::new(&env)
+        };
+        let recipient_max_payouts =
+            if partial && source.recipient_max_payouts.len() == source_len {
+                select_by_indices(&env, &source.recipient_max_payouts, &indices)
+            } else if source.recipient_max_payouts.len() == new_len {
+                source.recipient_max_payouts.clone()
+            } else {
+                Vec::new(&env)
+            };
+        // Ratios must sum to 10 000, so a subset can never stay valid.
+        let ratios = if !partial && source.ratios.len() == new_len {
+            source.ratios.clone()
+        } else {
+            Vec::new(&env)
+        };
         let overflow_behavior = overrides
             .new_overflow_behavior
             .map(|sym| {
@@ -6995,21 +7140,23 @@ impl SplitContract {
             tranches: source.tranches.clone(),
             co_signers: source.co_signers.clone(),
             required_signatures: source.required_signatures,
-            signatures: source.signatures.clone(),
+            // Approval / progress state belongs to the source invoice and
+            // must not carry over into a fresh clone.
+            signatures: Vec::new(&env),
             approver: source.approver.clone(),
-            approved: source.approved,
+            approved: false,
             condition_oracle: source.condition_oracle.clone(),
-            condition_met: source.condition_met,
+            condition_met: false,
             penalty_bps: source.penalty_bps,
             penalty_deadline: source.penalty_deadline,
             penalty_tiers: source.penalty_tiers.clone(),
             allowed_callers: source.allowed_callers.clone(),
             min_funding_bps: source.min_funding_bps,
             release_stages: source.release_stages.clone(),
-            released_stages: source.released_stages,
+            released_stages: 0,
             allowed_payers: source.allowed_payers.clone(),
             price_oracle: source.price_oracle.clone(),
-            swap_tokens: source.swap_tokens.clone(),
+            swap_tokens,
             tax_bps: source.tax_bps,
             tax_authority: source.tax_authority.clone(),
             insurance_premium_bps: source.insurance_premium_bps,
@@ -7019,7 +7166,7 @@ impl SplitContract {
             accepted_tokens: source.accepted_tokens.clone(),
             forward_to: source.forward_to.clone(),
             forward_invoice_id: source.forward_invoice_id,
-            split_rules: source.split_rules.clone(),
+            split_rules,
             auto_resolve_rules: source.auto_resolve_rules.clone(),
             creator_cosigner: source.creator_cosigner.clone(),
             velocity_limit: source.velocity_limit,
@@ -7043,7 +7190,7 @@ impl SplitContract {
             disputed: false,
             admin_frozen: false,
             scheduled_release_at: source.scheduled_release_at,
-            priorities: source.priorities.clone(),
+            priorities,
             target_usd_cents: source.target_usd_cents,
             refunded_addresses: Vec::new(&env),
             oracle: source.oracle.clone(),
@@ -7054,7 +7201,7 @@ impl SplitContract {
             held_until: None,
             milestones: source.milestones.clone(),
             milestones_released: 0,
-            recipient_max_payouts: source.recipient_max_payouts.clone(),
+            recipient_max_payouts,
             twafr_numerator: 0,
             twafr_last_ledger: 0,
             release_condition_hash: source.release_condition_hash.clone(),
@@ -7068,7 +7215,7 @@ impl SplitContract {
             early_bird_fee_credit: 0,
             creator_fee_bps: source.creator_fee_bps,
             ratio_denominator: source.ratio_denominator,
-            ratios: source.ratios.clone(),
+            ratios,
             metadata_hash: source.metadata_hash.clone(),
         };
 
@@ -7077,6 +7224,33 @@ impl SplitContract {
             env.storage().persistent().set(&metadata_hash_key(id), &hash);
         }
         events::invoice_cloned(&env, source_id, id);
+
+        // Issue #926: audit trail for the clone on both sides of the lineage.
+        append_audit_entry(&env, source_id, symbol_short!("cloned_to"), &creator);
+        append_audit_entry(&env, id, symbol_short!("cloned_fr"), &creator);
+        let record = CloneRecord {
+            source_id,
+            clone_id: id,
+            creator: creator.clone(),
+            partial,
+            recipient_indices: indices.clone(),
+            modified_fields,
+            cloned_at: env.ledger().timestamp(),
+            ledger: env.ledger().sequence(),
+        };
+        env.storage().persistent().set(&clone_record_key(id), &record);
+        let mut history: Vec<CloneRecord> = env
+            .storage()
+            .persistent()
+            .get(&clone_history_key(source_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        history.push_back(record);
+        env.storage()
+            .persistent()
+            .set(&clone_history_key(source_id), &history);
+        if partial {
+            events::invoice_partially_cloned(&env, source_id, id, indices.len());
+        }
 
         // Index each recipient -> invoice ID.
         for recipient in recipients.iter() {
@@ -7847,6 +8021,9 @@ impl SplitContract {
                 .persistent()
                 .set(&global_vel_key(payer), &global_window);
         }
+
+        // Issue #912: contract-wide payment velocity limits (count, volume, cooldown).
+        velocity::enforce(env, payer, amount);
 
         let token_client = token::Client::new(env, &funding_token_for(&invoice));
 
@@ -9238,6 +9415,11 @@ impl SplitContract {
         if invoice.status == InvoiceStatus::Disputed {
             panic!("{}", ContractError::InvoiceDisputed as u32);
         }
+        // Issue #928: no funds move to unverified recipients.
+        assert!(
+            recipients_verified(env, invoice_id, invoice),
+            "recipient not verified"
+        );
         if invoice.tranches.is_empty() {
             Self::_release_full(env, invoice_id, invoice, actor);
         } else {
@@ -9252,6 +9434,11 @@ impl SplitContract {
         actor: &Address,
     ) {
         if invoice.milestones.is_empty() {
+            return;
+        }
+        // Issue #928: hold milestone payouts in escrow until every recipient
+        // has completed authentication.
+        if !recipients_verified(env, invoice_id, invoice) {
             return;
         }
         let total: i128 = invoice.amounts.iter().sum();
@@ -13991,6 +14178,7 @@ impl SplitContract {
             .persistent()
             .remove(&invoice_ext2_key(invoice_id));
 
+        record_archived(&env, invoice_id, None);
         events::invoice_archived(&env, invoice_id);
     }
 
@@ -14106,6 +14294,7 @@ impl SplitContract {
                 env.storage().persistent().remove(&invoice_ext2_key(id));
 
                 archived.push_back(id);
+                record_archived(&env, id, None);
                 events::invoice_archived(&env, id);
             }
         }
@@ -16138,6 +16327,398 @@ fn transfer_audit_key(invoice_id: u64) -> (Symbol, u64) {
     (symbol_short!("audit_log"), invoice_id)
 }
 
+fn archival_record_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("arch_rec"), id)
+}
+
+fn archival_policy_key() -> Symbol {
+    symbol_short!("arch_pol")
+}
+
+fn archival_stats_key() -> Symbol {
+    symbol_short!("arch_stat")
+}
+
+/// Issue #927: default archival policy — sweeps disabled until an admin opts in.
+fn default_archival_policy() -> ArchivalPolicy {
+    ArchivalPolicy {
+        enabled: false,
+        sweep_interval_ledgers: 17_280,
+        max_batch: 20,
+        retention_ledgers: 0,
+        auto_purge: false,
+        restore_hold_ledgers: ARCHIVE_AFTER_LEDGERS as u32,
+    }
+}
+
+fn load_archival_policy(env: &Env) -> ArchivalPolicy {
+    env.storage()
+        .instance()
+        .get(&archival_policy_key())
+        .unwrap_or_else(default_archival_policy)
+}
+
+fn load_archival_stats(env: &Env) -> ArchivalStats {
+    env.storage()
+        .instance()
+        .get(&archival_stats_key())
+        .unwrap_or(ArchivalStats {
+            total_archived: 0,
+            total_restored: 0,
+            total_purged: 0,
+            last_sweep_ledger: 0,
+            sweep_cursor: 0,
+        })
+}
+
+fn save_archival_stats(env: &Env, stats: &ArchivalStats) {
+    env.storage().instance().set(&archival_stats_key(), stats);
+}
+
+fn load_archival_record(env: &Env, id: u64) -> Option<ArchivalRecord> {
+    env.storage().persistent().get(&archival_record_key(id))
+}
+
+fn save_archival_record(env: &Env, id: u64, record: &ArchivalRecord) {
+    env.storage().persistent().set(&archival_record_key(id), record);
+    env.storage().persistent().extend_ttl(
+        &archival_record_key(id),
+        INVOICE_HOT_TTL_LEDGERS / 2,
+        INVOICE_HOT_TTL_LEDGERS,
+    );
+}
+
+/// Issue #927: true while a restored invoice is still inside its hold window.
+fn in_restore_hold(env: &Env, id: u64) -> bool {
+    match load_archival_record(env, id) {
+        Some(record) if record.status == ArchivalStatus::Restored => {
+            let restored_at = record.restored_at_ledger.unwrap_or(0);
+            let hold = load_archival_policy(env).restore_hold_ledgers;
+            env.ledger().sequence().saturating_sub(restored_at) < hold
+        }
+        _ => false,
+    }
+}
+
+/// Issue #927: invoice data lives in instance storage once archived.
+fn is_invoice_archived(env: &Env, id: u64) -> bool {
+    if env.storage().instance().has(&archive_marker_key(id))
+        || env.storage().persistent().has(&archive_marker_key(id))
+    {
+        return true;
+    }
+    matches!(
+        load_archival_record(env, id),
+        Some(ArchivalRecord { status: ArchivalStatus::Archived, .. })
+            | Some(ArchivalRecord { status: ArchivalStatus::Purged, .. })
+    )
+}
+
+/// Issue #927: track archival status, update stats and the audit trail.
+fn record_archived(env: &Env, id: u64, actor: Option<Address>) {
+    let previous = load_archival_record(env, id);
+    let archive_count = previous.as_ref().map(|r| r.archive_count).unwrap_or(0) + 1;
+    let record = ArchivalRecord {
+        status: ArchivalStatus::Archived,
+        archived_at_ledger: env.ledger().sequence(),
+        archived_by: actor.clone(),
+        restored_at_ledger: None,
+        restored_by: None,
+        purged_at_ledger: None,
+        archive_count,
+    };
+    save_archival_record(env, id, &record);
+
+    let mut stats = load_archival_stats(env);
+    stats.total_archived = stats.total_archived.saturating_add(1);
+    save_archival_stats(env, &stats);
+
+    let audit_actor = actor.unwrap_or_else(|| env.current_contract_address());
+    append_audit_entry(env, id, symbol_short!("archived"), &audit_actor);
+}
+
+/// Issue #927: an invoice qualifies for scheduled archival when it is
+/// completed, older than `archive_after_ledgers`, not already archived and
+/// not inside a post-restore hold.
+fn is_archival_eligible(env: &Env, id: u64) -> bool {
+    if is_invoice_archived(env, id) || in_restore_hold(env, id) {
+        return false;
+    }
+    let core: InvoiceCore = match env.storage().persistent().get(&invoice_key(id)) {
+        Some(core) => core,
+        None => return false,
+    };
+    if core.status != InvoiceStatus::Released && core.status != InvoiceStatus::Refunded {
+        return false;
+    }
+    let created_ledger: u32 = env
+        .storage()
+        .persistent()
+        .get(&created_ledger_key(id))
+        .or_else(|| env.storage().instance().get(&created_ledger_key(id)))
+        .unwrap_or_else(|| env.ledger().sequence());
+    let archive_after: u64 = env
+        .storage()
+        .instance()
+        .get(&archive_after_ledgers_key())
+        .unwrap_or(ARCHIVE_AFTER_LEDGERS);
+    (env.ledger().sequence() as u64).saturating_sub(created_ledger as u64) >= archive_after
+}
+
+/// Issue #927: true when an archived invoice has outlived the retention period.
+fn is_purge_eligible(env: &Env, id: u64, policy: &ArchivalPolicy) -> bool {
+    if policy.retention_ledgers == 0 {
+        return false;
+    }
+    match load_archival_record(env, id) {
+        Some(record) if record.status == ArchivalStatus::Archived => {
+            env.ledger().sequence().saturating_sub(record.archived_at_ledger)
+                >= policy.retention_ledgers
+        }
+        _ => false,
+    }
+}
+
+/// Issue #927: cleanup — drop the bulky payment shards of an archived invoice
+/// while keeping the invoice record, compact overlay and audit log readable.
+fn purge_archived_invoice(env: &Env, id: u64, actor: &Address) {
+    for shard_id in 0..SHARD_COUNT {
+        let shard_key = pay_shard_key(id, shard_id);
+        env.storage().instance().remove(&shard_key);
+        env.storage().persistent().remove(&shard_key);
+    }
+    let mut record = load_archival_record(env, id).expect("archival record not found");
+    record.status = ArchivalStatus::Purged;
+    record.purged_at_ledger = Some(env.ledger().sequence());
+    save_archival_record(env, id, &record);
+
+    let mut stats = load_archival_stats(env);
+    stats.total_purged = stats.total_purged.saturating_add(1);
+    save_archival_stats(env, &stats);
+
+    append_audit_entry(env, id, symbol_short!("purged"), actor);
+    events::invoice_archive_purged(env, id);
+}
+
+/// Issue #928: failed responses allowed before a challenge is locked out.
+const MAX_RECIPIENT_AUTH_ATTEMPTS: u32 = 3;
+/// Issue #928: bounds on a challenge's lifetime, in seconds.
+const MIN_RECIPIENT_AUTH_TTL_SECS: u64 = 60;
+const MAX_RECIPIENT_AUTH_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+fn recipient_auth_key(invoice_id: u64, recipient: &Address) -> (Symbol, u64, Address) {
+    (symbol_short!("rcp_auth"), invoice_id, recipient.clone())
+}
+
+fn recipient_auth_required_key(invoice_id: u64) -> (Symbol, u64) {
+    (symbol_short!("rcp_areq"), invoice_id)
+}
+
+fn recipient_auth_log_key(invoice_id: u64) -> (Symbol, u64) {
+    (symbol_short!("rcp_alog"), invoice_id)
+}
+
+fn recipient_auth_nonce_key() -> Symbol {
+    symbol_short!("rcp_anon")
+}
+
+fn is_recipient_auth_required(env: &Env, invoice_id: u64) -> bool {
+    env.storage()
+        .persistent()
+        .get(&recipient_auth_required_key(invoice_id))
+        .unwrap_or(false)
+}
+
+fn load_recipient_auth(env: &Env, invoice_id: u64, recipient: &Address) -> Option<RecipientAuth> {
+    env.storage()
+        .persistent()
+        .get(&recipient_auth_key(invoice_id, recipient))
+}
+
+fn save_recipient_auth(env: &Env, auth: &RecipientAuth) {
+    env.storage()
+        .persistent()
+        .set(&recipient_auth_key(auth.invoice_id, &auth.recipient), auth);
+}
+
+/// Issue #928: true when the invoice does not require authentication, or
+/// every recipient is currently `Verified`.
+fn recipients_verified(env: &Env, invoice_id: u64, invoice: &Invoice) -> bool {
+    if !is_recipient_auth_required(env, invoice_id) {
+        return true;
+    }
+    invoice.recipients.iter().all(|r| {
+        matches!(
+            load_recipient_auth(env, invoice_id, &r),
+            Some(RecipientAuth { status: RecipientAuthStatus::Verified, .. })
+        )
+    })
+}
+
+/// Issue #928: append to the per-invoice verification audit log.
+fn log_recipient_auth(env: &Env, invoice_id: u64, recipient: &Address, action: Symbol, actor: &Address) {
+    let mut log: Vec<RecipientAuthLogEntry> = env
+        .storage()
+        .persistent()
+        .get(&recipient_auth_log_key(invoice_id))
+        .unwrap_or_else(|| Vec::new(env));
+    log.push_back(RecipientAuthLogEntry {
+        recipient: recipient.clone(),
+        action: action.clone(),
+        actor: actor.clone(),
+        timestamp: env.ledger().timestamp(),
+        ledger: env.ledger().sequence(),
+    });
+    env.storage()
+        .persistent()
+        .set(&recipient_auth_log_key(invoice_id), &log);
+    events::recipient_auth_changed(env, invoice_id, recipient, action);
+}
+
+/// Issue #928: expected response to `challenge` — `sha256(challenge || recipient_xdr)`.
+fn recipient_challenge_response(env: &Env, challenge: &BytesN<32>, recipient: &Address) -> BytesN<32> {
+    let mut preimage = Bytes::from_array(env, &challenge.to_array());
+    preimage.append(&recipient.clone().to_xdr(env));
+    env.crypto().sha256(&preimage).into()
+}
+
+/// Issue #929: default undo window for reversible operations (1 hour).
+const DEFAULT_ROLLBACK_WINDOW_SECS: u64 = 3_600;
+const MIN_ROLLBACK_WINDOW_SECS: u64 = 60;
+const MAX_ROLLBACK_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+
+fn rollback_window_key() -> Symbol {
+    symbol_short!("rb_window")
+}
+
+fn rollback_counter_key() -> Symbol {
+    symbol_short!("rb_ctr")
+}
+
+fn reversible_op_key(op_id: u64) -> (Symbol, u64) {
+    (symbol_short!("rb_op"), op_id)
+}
+
+fn invoice_ops_key(invoice_id: u64) -> (Symbol, u64) {
+    (symbol_short!("rb_ops"), invoice_id)
+}
+
+fn get_rollback_window_secs(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&rollback_window_key())
+        .unwrap_or(DEFAULT_ROLLBACK_WINDOW_SECS)
+}
+
+/// Issue #929: capture the invoice fields a reversible operation may touch.
+fn snapshot_operation_state(invoice: &Invoice) -> OperationSnapshot {
+    OperationSnapshot {
+        deadline: invoice.deadline,
+        amounts: invoice.amounts.clone(),
+        base_amounts: invoice.base_amounts.clone(),
+        status: invoice.status.clone(),
+        funded: invoice.funded,
+        payment_count: invoice.payments.len(),
+    }
+}
+
+fn hash_operation_snapshot(env: &Env, snapshot: &OperationSnapshot) -> BytesN<32> {
+    env.crypto().sha256(&snapshot.clone().to_xdr(env)).into()
+}
+
+/// Issue #929: apply a reversible mutation to `invoice` and record it.
+///
+/// `before` is the snapshot taken prior to the mutation; the post-mutation
+/// snapshot hash is stored so `undo_operation` can detect any later change.
+fn record_reversible_op(
+    env: &Env,
+    invoice_id: u64,
+    invoice: &Invoice,
+    kind: ReversibleOpKind,
+    actor: &Address,
+    before: OperationSnapshot,
+) -> u64 {
+    let op_id: u64 = env
+        .storage()
+        .instance()
+        .get(&rollback_counter_key())
+        .unwrap_or(0u64)
+        + 1;
+    env.storage().instance().set(&rollback_counter_key(), &op_id);
+
+    let now = env.ledger().timestamp();
+    let after_hash = hash_operation_snapshot(env, &snapshot_operation_state(invoice));
+    let op = ReversibleOp {
+        op_id,
+        invoice_id,
+        kind: kind.clone(),
+        actor: actor.clone(),
+        before,
+        after_hash,
+        created_at: now,
+        expires_at: now.saturating_add(get_rollback_window_secs(env)),
+        status: ReversibleOpStatus::Recorded,
+        undone_at: None,
+    };
+    env.storage().persistent().set(&reversible_op_key(op_id), &op);
+
+    let mut ops: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&invoice_ops_key(invoice_id))
+        .unwrap_or_else(|| Vec::new(env));
+    ops.push_back(op_id);
+    env.storage().persistent().set(&invoice_ops_key(invoice_id), &ops);
+
+    events::reversible_op_recorded(env, invoice_id, op_id, kind);
+    op_id
+}
+
+fn clone_record_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("clone_rec"), id)
+}
+
+fn clone_history_key(source_id: u64) -> (Symbol, u64) {
+    (symbol_short!("clone_his"), source_id)
+}
+
+/// Issue #926: copy the entries of `src` at `indices`, in index order.
+fn select_by_indices<T>(env: &Env, src: &Vec<T>, indices: &Vec<u32>) -> Vec<T>
+where
+    T: IntoVal<Env, Val> + TryFromVal<Env, Val>,
+{
+    let mut out: Vec<T> = Vec::new(env);
+    for idx in indices.iter() {
+        if let Some(item) = src.get(idx) {
+            out.push_back(item);
+        }
+    }
+    out
+}
+
+/// Issue #926: reject a clone whose resulting state could not have been
+/// created through `create_invoice`.
+fn validate_cloned_state(env: &Env, recipients: &Vec<Address>, amounts: &Vec<i128>, deadline: u64) {
+    assert!(!recipients.is_empty(), "clone has no recipients");
+    assert!(
+        recipients.len() == amounts.len(),
+        "clone recipients and amounts length mismatch"
+    );
+    for amount in amounts.iter() {
+        assert!(amount > 0, "clone amount must be positive");
+    }
+    for i in 0..recipients.len() {
+        let r = recipients.get(i).unwrap();
+        for j in (i + 1)..recipients.len() {
+            assert!(recipients.get(j).unwrap() != r, "duplicate clone recipient");
+        }
+    }
+    assert!(
+        deadline > env.ledger().timestamp(),
+        "clone deadline must be in the future"
+    );
+}
+
 fn archived_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("archv_inv"), id)
 }
@@ -17023,6 +17604,228 @@ impl SplitContract {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Issue #892: Contract security audit framework
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl SplitContract {
+    /// Register `auditor` as a trusted security auditor. Admin only.
+    pub fn add_security_auditor(env: Env, auditor: Address) {
+        require_admin(&env);
+        security_audit::add_auditor(&env, &auditor);
+    }
+
+    /// Remove a previously registered security auditor. Admin only.
+    pub fn remove_security_auditor(env: Env, auditor: Address) {
+        require_admin(&env);
+        security_audit::remove_auditor(&env, &auditor);
+    }
+
+    /// List all registered security auditors.
+    pub fn get_security_auditors(env: Env) -> Vec<Address> {
+        security_audit::get_auditors(&env)
+    }
+
+    /// Run the contract-level security audit and persist the report.
+    /// Callable by a registered auditor or the admin.
+    pub fn run_security_audit(env: Env, auditor: Address) -> security_audit::SecurityAuditReport {
+        security_audit::run_contract_audit(&env, &auditor)
+    }
+
+    /// Run the invoice-level security audit for `invoice_id` and persist the report.
+    /// Callable by a registered auditor or the admin.
+    pub fn run_invoice_security_audit(
+        env: Env,
+        auditor: Address,
+        invoice_id: u64,
+    ) -> security_audit::SecurityAuditReport {
+        security_audit::run_invoice_audit(&env, &auditor, invoice_id)
+    }
+
+    /// Fetch a stored security audit report by id.
+    pub fn get_security_audit(
+        env: Env,
+        audit_id: u64,
+    ) -> Option<security_audit::SecurityAuditReport> {
+        security_audit::get_report(&env, audit_id)
+    }
+
+    /// Total number of security audits run so far (also the latest audit id).
+    pub fn get_security_audit_count(env: Env) -> u64 {
+        security_audit::get_audit_count(&env)
+    }
+
+    /// Append an entry to the bounded security event log.
+    /// Callable by a registered auditor or the admin.
+    pub fn log_security_event(
+        env: Env,
+        reporter: Address,
+        kind: Symbol,
+        severity: security_audit::AuditSeverity,
+        invoice_id: Option<u64>,
+    ) {
+        security_audit::log_security_event(&env, &reporter, kind, severity, invoice_id);
+    }
+
+    /// Return the security event log, oldest entry first.
+    pub fn get_security_events(env: Env) -> Vec<security_audit::SecurityEvent> {
+        security_audit::get_security_events(&env)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #911: Partial invoice payment tracking
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl SplitContract {
+    /// Initialise per-recipient partial payment tracking for an invoice with
+    /// the given milestone thresholds (ascending basis points). Creator only.
+    pub fn init_payment_tracking(
+        env: Env,
+        creator: Address,
+        invoice_id: u64,
+        milestone_bps: Vec<u32>,
+    ) -> payment_tracking::PaymentTracker {
+        require_not_paused(&env);
+        payment_tracking::init_tracking(&env, &creator, invoice_id, milestone_bps)
+    }
+
+    /// Record a partial payment to `recipient`. Creator only.
+    pub fn record_partial_payment(
+        env: Env,
+        creator: Address,
+        invoice_id: u64,
+        recipient: Address,
+        amount: i128,
+    ) -> payment_tracking::PaymentTracker {
+        require_not_paused(&env);
+        payment_tracking::record_payment(&env, &creator, invoice_id, &recipient, amount)
+    }
+
+    /// Settle a reached milestone. Milestones settle strictly in order. Creator only.
+    pub fn settle_payment_milestone(
+        env: Env,
+        creator: Address,
+        invoice_id: u64,
+        milestone_index: u32,
+    ) -> payment_tracking::PaymentTracker {
+        require_not_paused(&env);
+        payment_tracking::settle_milestone(&env, &creator, invoice_id, milestone_index)
+    }
+
+    /// Return the partial payment tracker for an invoice, if initialised.
+    pub fn get_payment_tracker(
+        env: Env,
+        invoice_id: u64,
+    ) -> Option<payment_tracking::PaymentTracker> {
+        payment_tracking::get_tracker(&env, invoice_id)
+    }
+
+    /// Return the paid-flag bitmask (bit `i` set = recipient `i` fully paid).
+    pub fn get_recipient_paid_flags(env: Env, invoice_id: u64) -> u64 {
+        payment_tracking::get_paid_flags(&env, invoice_id)
+    }
+
+    /// Whether recipient at `index` has been fully paid.
+    pub fn is_recipient_paid(env: Env, invoice_id: u64, index: u32) -> bool {
+        payment_tracking::is_recipient_paid(&env, invoice_id, index)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #912: Payment velocity limits
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl SplitContract {
+    /// Set the default velocity limits applied to every payer. Admin only.
+    pub fn set_velocity_config(env: Env, config: velocity::VelocityConfig) {
+        require_admin(&env);
+        velocity::set_default_config(&env, &config);
+    }
+
+    /// Return the default velocity limits.
+    pub fn get_velocity_config(env: Env) -> velocity::VelocityConfig {
+        velocity::get_default_config(&env)
+    }
+
+    /// Set (`Some`) or clear (`None`) a per-payer velocity override. Admin only.
+    pub fn set_payer_velocity_override(
+        env: Env,
+        payer: Address,
+        config: Option<velocity::VelocityConfig>,
+    ) {
+        require_admin(&env);
+        velocity::set_payer_override(&env, &payer, &config);
+    }
+
+    /// Return the velocity limits that apply to `payer`.
+    pub fn get_payer_velocity_config(env: Env, payer: Address) -> velocity::VelocityConfig {
+        velocity::effective_config(&env, &payer)
+    }
+
+    /// Return the current velocity window state for `payer`.
+    pub fn get_payer_velocity_state(env: Env, payer: Address) -> velocity::VelocityState {
+        velocity::get_state(&env, &payer)
+    }
+
+    /// Whether a payment of `amount` from `payer` would pass velocity checks now.
+    pub fn check_payer_velocity(env: Env, payer: Address, amount: i128) -> bool {
+        velocity::would_allow(&env, &payer, amount)
+    }
+
+    /// Clear a payer's velocity state. Admin only.
+    pub fn reset_payer_velocity(env: Env, payer: Address) {
+        require_admin(&env);
+        velocity::reset_state(&env, &payer);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #913: Split rules engine
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl SplitContract {
+    /// Attach criteria-based split rules to a pending invoice. Creator only.
+    pub fn set_invoice_split_rules(
+        env: Env,
+        creator: Address,
+        invoice_id: u64,
+        rules: Vec<split_rules::SplitRuleDef>,
+    ) {
+        require_not_paused(&env);
+        split_rules::set_rules(&env, &creator, invoice_id, rules);
+    }
+
+    /// Remove the split rules from a pending invoice. Creator only.
+    pub fn clear_invoice_split_rules(env: Env, creator: Address, invoice_id: u64) {
+        require_not_paused(&env);
+        split_rules::clear_rules(&env, &creator, invoice_id);
+    }
+
+    /// Return the split rules stored for an invoice (empty if none).
+    pub fn get_invoice_split_rules(env: Env, invoice_id: u64) -> Vec<split_rules::SplitRuleDef> {
+        split_rules::get_rules(&env, invoice_id)
+    }
+
+    /// Evaluate an invoice's split rules against its current funded amount,
+    /// payment count and the ledger timestamp. Returns one amount per recipient.
+    pub fn evaluate_invoice_split_rules(env: Env, invoice_id: u64) -> Vec<i128> {
+        split_rules::evaluate_for_invoice(&env, invoice_id)
+    }
+
+    /// Validate and evaluate `rules` against an arbitrary context without
+    /// storing anything. Useful for previewing a rule set before attaching it.
+    pub fn preview_split_rules(
+        env: Env,
+        rules: Vec<split_rules::SplitRuleDef>,
+        recipient_count: u32,
+        context: split_rules::RuleContext,
+    ) -> Vec<i128> {
+        split_rules::validate_rules(&rules, recipient_count);
+        split_rules::evaluate(&env, &rules, recipient_count, &context)
+    }
+}
+
 /// Move a finalised invoice from hot storage to cold archival storage.
 #[allow(dead_code)]
 fn archive_invoice(env: &Env, invoice_id: u64, invoice: &Invoice) {
@@ -17031,4 +17834,568 @@ fn archive_invoice(env: &Env, invoice_id: u64, invoice: &Invoice) {
         .persistent()
         .set(&archived_key(invoice_id), &core);
     remove_invoice(env, invoice_id);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #927: Invoice archival system — schedule, recovery, cleanup, status
+// ---------------------------------------------------------------------------
+
+#[contractimpl]
+impl SplitContract {
+    /// Configure the scheduled archival policy. Operator role or higher.
+    pub fn set_archival_policy(env: Env, admin: Address, policy: ArchivalPolicy) {
+        require_admin_role(&env, &admin, AdminRole::Operator);
+        assert!(policy.max_batch > 0 && policy.max_batch <= 50, "invalid archival batch size");
+        assert!(policy.sweep_interval_ledgers > 0, "sweep interval must be positive");
+        env.storage().instance().set(&archival_policy_key(), &policy);
+        events::archival_policy_updated(&env, &admin, policy.enabled, policy.retention_ledgers);
+    }
+
+    /// Return the active archival policy (defaults when never configured).
+    pub fn get_archival_policy(env: Env) -> ArchivalPolicy {
+        load_archival_policy(&env)
+    }
+
+    /// Return aggregate archival counters and the sweep cursor.
+    pub fn get_archival_stats(env: Env) -> ArchivalStats {
+        load_archival_stats(&env)
+    }
+
+    /// Return the archival status record for an invoice. Invoices that were
+    /// never archived report `Active`.
+    pub fn get_archival_status(env: Env, invoice_id: u64) -> ArchivalRecord {
+        load_archival_record(&env, invoice_id).unwrap_or(ArchivalRecord {
+            status: ArchivalStatus::Active,
+            archived_at_ledger: 0,
+            archived_by: None,
+            restored_at_ledger: None,
+            restored_by: None,
+            purged_at_ledger: None,
+            archive_count: 0,
+        })
+    }
+
+    /// Scheduled archival sweep. Permissionless so keepers can drive it, but
+    /// rate-limited to once per `sweep_interval_ledgers`.
+    ///
+    /// Scans up to `max_batch` invoice IDs from the stored cursor, archives
+    /// every eligible one, and — when `auto_purge` is set — purges archived
+    /// invoices past the retention period. Returns the IDs archived this run.
+    pub fn run_archival_sweep(env: Env) -> Vec<u64> {
+        require_not_paused(&env);
+        let policy = load_archival_policy(&env);
+        assert!(policy.enabled, "archival sweep disabled");
+
+        let mut stats = load_archival_stats(&env);
+        let now = env.ledger().sequence();
+        if stats.last_sweep_ledger != 0 {
+            assert!(
+                now.saturating_sub(stats.last_sweep_ledger) >= policy.sweep_interval_ledgers,
+                "archival sweep not due"
+            );
+        }
+
+        let last_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&counter_key())
+            .unwrap_or(0u64);
+        let mut archived: Vec<u64> = Vec::new(&env);
+        let mut cursor = stats.sweep_cursor;
+        let contract = env.current_contract_address();
+
+        for _ in 0..policy.max_batch {
+            if cursor >= last_id {
+                cursor = 0;
+                break;
+            }
+            cursor += 1;
+            let id = cursor;
+            if is_archival_eligible(&env, id) {
+                let core: InvoiceCore = env.storage().persistent().get(&invoice_key(id)).unwrap();
+                archive_invoice_storage(&env, id, &core);
+                record_archived(&env, id, Some(contract.clone()));
+                events::invoice_archived(&env, id);
+                archived.push_back(id);
+            } else if policy.auto_purge && is_purge_eligible(&env, id, &policy) {
+                purge_archived_invoice(&env, id, &contract);
+            }
+        }
+
+        // `record_archived` / `purge_archived_invoice` update the counters, so
+        // reload before writing the cursor back.
+        stats = load_archival_stats(&env);
+        stats.sweep_cursor = cursor;
+        stats.last_sweep_ledger = now;
+        save_archival_stats(&env, &stats);
+
+        events::archival_sweep_completed(&env, archived.len(), cursor);
+        archived
+    }
+
+    /// Recovery: move an archived invoice back into persistent storage so it
+    /// becomes fully mutable again. Callable by the invoice creator or an
+    /// Operator admin. The invoice is held out of re-archival for
+    /// `restore_hold_ledgers`.
+    pub fn restore_archived_invoice(env: Env, caller: Address, invoice_id: u64) {
+        require_not_paused(&env);
+        assert!(is_invoice_archived(&env, invoice_id), "invoice not archived");
+        if let Some(record) = load_archival_record(&env, invoice_id) {
+            assert!(
+                record.status != ArchivalStatus::Purged,
+                "purged invoice cannot be restored"
+            );
+        }
+
+        let core: InvoiceCore = env
+            .storage()
+            .instance()
+            .get(&invoice_key(invoice_id))
+            .or_else(|| env.storage().persistent().get(&invoice_key(invoice_id)))
+            .expect("invoice not found");
+        if caller == core.creator {
+            caller.require_auth();
+        } else {
+            require_admin_role(&env, &caller, AdminRole::Operator);
+        }
+
+        let instance = env.storage().instance();
+        let persistent = env.storage().persistent();
+        persistent.set(&invoice_key(invoice_id), &core);
+        instance.remove(&invoice_key(invoice_id));
+        if let Some(ext) = instance.get::<_, InvoiceExt>(&invoice_ext_key(invoice_id)) {
+            persistent.set(&invoice_ext_key(invoice_id), &ext);
+            instance.remove(&invoice_ext_key(invoice_id));
+        }
+        if let Some(ext2) = instance.get::<_, InvoiceExt2>(&invoice_ext2_key(invoice_id)) {
+            persistent.set(&invoice_ext2_key(invoice_id), &ext2);
+            instance.remove(&invoice_ext2_key(invoice_id));
+        }
+        if let Some(compact) = instance.get::<_, CompactInvoice>(&invoice_compact_key(invoice_id)) {
+            persistent.set(&invoice_compact_key(invoice_id), &compact);
+            instance.remove(&invoice_compact_key(invoice_id));
+        }
+        for shard_id in 0..SHARD_COUNT {
+            let shard_key = pay_shard_key(invoice_id, shard_id);
+            if let Some(payments) = instance.get::<(Symbol, u64, u64), Vec<Payment>>(&shard_key) {
+                persistent.set(&shard_key, &payments);
+                instance.remove(&shard_key);
+            }
+        }
+        if let Some(log) = instance.get::<_, Vec<AuditEntry>>(&audit_log_key(invoice_id)) {
+            persistent.set(&audit_log_key(invoice_id), &log);
+            instance.remove(&audit_log_key(invoice_id));
+        }
+        if let Some(created) = instance.get::<_, u32>(&created_ledger_key(invoice_id)) {
+            persistent.set(&created_ledger_key(invoice_id), &created);
+            instance.remove(&created_ledger_key(invoice_id));
+        }
+        instance.remove(&archive_marker_key(invoice_id));
+        persistent.remove(&archive_marker_key(invoice_id));
+        bump_invoice_entry_ttl(&env, invoice_id);
+
+        let mut record = load_archival_record(&env, invoice_id).unwrap_or(ArchivalRecord {
+            status: ArchivalStatus::Archived,
+            archived_at_ledger: 0,
+            archived_by: None,
+            restored_at_ledger: None,
+            restored_by: None,
+            purged_at_ledger: None,
+            archive_count: 1,
+        });
+        record.status = ArchivalStatus::Restored;
+        record.restored_at_ledger = Some(env.ledger().sequence());
+        record.restored_by = Some(caller.clone());
+        save_archival_record(&env, invoice_id, &record);
+
+        let mut stats = load_archival_stats(&env);
+        stats.total_restored = stats.total_restored.saturating_add(1);
+        save_archival_stats(&env, &stats);
+
+        append_audit_entry(&env, invoice_id, symbol_short!("restored"), &caller);
+        events::invoice_restored(&env, invoice_id, &caller);
+    }
+
+    /// Cleanup policy: purge archived invoices that have outlived
+    /// `retention_ledgers`. Operator role or higher. Invoices not yet past
+    /// retention are skipped. Returns the IDs purged.
+    pub fn purge_archived_invoices(env: Env, admin: Address, invoice_ids: Vec<u64>) -> Vec<u64> {
+        require_admin_role(&env, &admin, AdminRole::Operator);
+        assert!(invoice_ids.len() <= 20, "batch limit exceeded");
+        let policy = load_archival_policy(&env);
+        let mut purged: Vec<u64> = Vec::new(&env);
+        for id in invoice_ids.iter() {
+            if is_purge_eligible(&env, id, &policy) {
+                purge_archived_invoice(&env, id, &admin);
+                purged.push_back(id);
+            }
+        }
+        purged
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #928: Recipient authentication (challenge-response before payout)
+// ---------------------------------------------------------------------------
+
+#[contractimpl]
+impl SplitContract {
+    /// Require (or stop requiring) every recipient of `invoice_id` to pass
+    /// challenge-response verification before any funds are released to them.
+    /// Creator or co-creator only; the invoice must still be Pending.
+    pub fn set_recipient_auth_required(env: Env, caller: Address, invoice_id: u64, required: bool) {
+        require_not_paused(&env);
+        caller.require_auth();
+        let invoice = load_invoice(&env, invoice_id);
+        require_creator_or_cocreator(&invoice, &caller);
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice not pending");
+        env.storage()
+            .persistent()
+            .set(&recipient_auth_required_key(invoice_id), &required);
+        let action = if required {
+            symbol_short!("auth_on")
+        } else {
+            symbol_short!("auth_off")
+        };
+        append_audit_entry(&env, invoice_id, action, &caller);
+    }
+
+    /// Whether `invoice_id` requires recipient authentication before release.
+    pub fn get_recipient_auth_required(env: Env, invoice_id: u64) -> bool {
+        is_recipient_auth_required(&env, invoice_id)
+    }
+
+    /// Issue a fresh challenge to `recipient`, valid for `ttl_secs`.
+    ///
+    /// The recipient proves control of its address by calling
+    /// [`respond_recipient_challenge`] with its own authorization and
+    /// `sha256(challenge || recipient_xdr)`. Re-issuing replaces any pending
+    /// challenge and resets the attempt counter.
+    pub fn issue_recipient_challenge(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        recipient: Address,
+        ttl_secs: u64,
+    ) -> BytesN<32> {
+        require_not_paused(&env);
+        caller.require_auth();
+        let invoice = load_invoice(&env, invoice_id);
+        require_creator_or_cocreator(&invoice, &caller);
+        assert!(invoice.recipients.contains(&recipient), "not an invoice recipient");
+        assert!(
+            ttl_secs >= MIN_RECIPIENT_AUTH_TTL_SECS && ttl_secs <= MAX_RECIPIENT_AUTH_TTL_SECS,
+            "invalid challenge ttl"
+        );
+        if let Some(existing) = load_recipient_auth(&env, invoice_id, &recipient) {
+            assert!(
+                existing.status != RecipientAuthStatus::Verified,
+                "recipient already verified"
+            );
+        }
+
+        let nonce: u64 = env
+            .storage()
+            .instance()
+            .get(&recipient_auth_nonce_key())
+            .unwrap_or(0u64)
+            + 1;
+        env.storage().instance().set(&recipient_auth_nonce_key(), &nonce);
+
+        let now = env.ledger().timestamp();
+        let mut seed = env.current_contract_address().to_xdr(&env);
+        seed.append(&Bytes::from_array(&env, &invoice_id.to_be_bytes()));
+        seed.append(&recipient.clone().to_xdr(&env));
+        seed.append(&Bytes::from_array(&env, &nonce.to_be_bytes()));
+        seed.append(&Bytes::from_array(&env, &now.to_be_bytes()));
+        seed.append(&Bytes::from_array(&env, &env.ledger().sequence().to_be_bytes()));
+        let challenge: BytesN<32> = env.crypto().sha256(&seed).into();
+
+        save_recipient_auth(
+            &env,
+            &RecipientAuth {
+                invoice_id,
+                recipient: recipient.clone(),
+                status: RecipientAuthStatus::ChallengeIssued,
+                challenge: Some(challenge.clone()),
+                issued_at: now,
+                expires_at: now + ttl_secs,
+                verified_at: None,
+                attempts: 0,
+                nonce,
+            },
+        );
+        log_recipient_auth(&env, invoice_id, &recipient, symbol_short!("chal_iss"), &caller);
+        challenge
+    }
+
+    /// Answer an outstanding challenge. Requires `recipient`'s authorization.
+    ///
+    /// Returns `true` on success. A late response marks the challenge
+    /// `Expired`; a wrong response counts an attempt and, after
+    /// `MAX_RECIPIENT_AUTH_ATTEMPTS`, marks it `Failed`. Both return `false`
+    /// and persist the new state, so a new challenge must then be issued.
+    pub fn respond_recipient_challenge(
+        env: Env,
+        recipient: Address,
+        invoice_id: u64,
+        response: BytesN<32>,
+    ) -> bool {
+        require_not_paused(&env);
+        recipient.require_auth();
+        let mut auth =
+            load_recipient_auth(&env, invoice_id, &recipient).expect("no challenge issued");
+        assert!(
+            auth.status == RecipientAuthStatus::ChallengeIssued,
+            "no active challenge"
+        );
+        let challenge = auth.challenge.clone().expect("no active challenge");
+
+        if env.ledger().timestamp() > auth.expires_at {
+            auth.status = RecipientAuthStatus::Expired;
+            auth.challenge = None;
+            save_recipient_auth(&env, &auth);
+            log_recipient_auth(&env, invoice_id, &recipient, symbol_short!("chal_exp"), &recipient);
+            return false;
+        }
+
+        if response == recipient_challenge_response(&env, &challenge, &recipient) {
+            auth.status = RecipientAuthStatus::Verified;
+            auth.challenge = None;
+            auth.verified_at = Some(env.ledger().timestamp());
+            save_recipient_auth(&env, &auth);
+            log_recipient_auth(&env, invoice_id, &recipient, symbol_short!("verified"), &recipient);
+            append_audit_entry(&env, invoice_id, symbol_short!("rcp_verif"), &recipient);
+            return true;
+        }
+
+        auth.attempts += 1;
+        let action = if auth.attempts >= MAX_RECIPIENT_AUTH_ATTEMPTS {
+            auth.status = RecipientAuthStatus::Failed;
+            auth.challenge = None;
+            symbol_short!("auth_fail")
+        } else {
+            symbol_short!("bad_resp")
+        };
+        save_recipient_auth(&env, &auth);
+        log_recipient_auth(&env, invoice_id, &recipient, action, &recipient);
+        false
+    }
+
+    /// Revoke a recipient's verification (e.g. on a suspected compromise).
+    /// Creator or co-creator only.
+    pub fn revoke_recipient_verification(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        recipient: Address,
+    ) {
+        require_not_paused(&env);
+        caller.require_auth();
+        let invoice = load_invoice(&env, invoice_id);
+        require_creator_or_cocreator(&invoice, &caller);
+        let mut auth =
+            load_recipient_auth(&env, invoice_id, &recipient).expect("no verification record");
+        auth.status = RecipientAuthStatus::Revoked;
+        auth.challenge = None;
+        auth.verified_at = None;
+        save_recipient_auth(&env, &auth);
+        log_recipient_auth(&env, invoice_id, &recipient, symbol_short!("revoked"), &caller);
+    }
+
+    /// Current authentication state for `recipient` on `invoice_id`.
+    /// A pending challenge past its deadline is reported as `Expired`.
+    pub fn get_recipient_auth(env: Env, invoice_id: u64, recipient: Address) -> Option<RecipientAuth> {
+        load_recipient_auth(&env, invoice_id, &recipient).map(|mut auth| {
+            if auth.status == RecipientAuthStatus::ChallengeIssued
+                && env.ledger().timestamp() > auth.expires_at
+            {
+                auth.status = RecipientAuthStatus::Expired;
+            }
+            auth
+        })
+    }
+
+    /// Whether `recipient` is currently verified for `invoice_id`.
+    pub fn is_recipient_verified(env: Env, invoice_id: u64, recipient: Address) -> bool {
+        matches!(
+            load_recipient_auth(&env, invoice_id, &recipient),
+            Some(RecipientAuth { status: RecipientAuthStatus::Verified, .. })
+        )
+    }
+
+    /// Full verification audit log for `invoice_id`, oldest first.
+    pub fn get_recipient_auth_log(env: Env, invoice_id: u64) -> Vec<RecipientAuthLogEntry> {
+        env.storage()
+            .persistent()
+            .get(&recipient_auth_log_key(invoice_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Helper for clients: the response `recipient` must submit for `challenge`.
+    pub fn compute_recipient_challenge_response(
+        env: Env,
+        challenge: BytesN<32>,
+        recipient: Address,
+    ) -> BytesN<32> {
+        recipient_challenge_response(&env, &challenge, &recipient)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #929: Reversible operations (undo / rollback within a time window)
+// ---------------------------------------------------------------------------
+
+#[contractimpl]
+impl SplitContract {
+    /// Set the undo window for reversible operations, in seconds.
+    /// Operator role or higher. Applies to operations recorded afterwards.
+    pub fn set_rollback_window(env: Env, admin: Address, window_secs: u64) {
+        require_admin_role(&env, &admin, AdminRole::Operator);
+        assert!(
+            window_secs >= MIN_ROLLBACK_WINDOW_SECS && window_secs <= MAX_ROLLBACK_WINDOW_SECS,
+            "invalid rollback window"
+        );
+        env.storage().instance().set(&rollback_window_key(), &window_secs);
+    }
+
+    /// Current undo window for reversible operations, in seconds.
+    pub fn get_rollback_window(env: Env) -> u64 {
+        get_rollback_window_secs(&env)
+    }
+
+    /// Change a Pending invoice's deadline, recording an undoable operation.
+    /// Creator or co-creator only. Returns the operation ID.
+    pub fn reversible_update_deadline(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        new_deadline: u64,
+    ) -> u64 {
+        require_not_paused(&env);
+        caller.require_auth();
+        let mut invoice = load_invoice(&env, invoice_id);
+        require_creator_or_cocreator(&invoice, &caller);
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice not pending");
+        assert!(new_deadline > env.ledger().timestamp(), "deadline must be in the future");
+
+        let before = snapshot_operation_state(&invoice);
+        invoice.deadline = new_deadline;
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("rv_dline"), &caller);
+        record_reversible_op(&env, invoice_id, &invoice, ReversibleOpKind::UpdateDeadline, &caller, before)
+    }
+
+    /// Change the recipient amounts of an unfunded Pending invoice, recording
+    /// an undoable operation. Creator or co-creator only.
+    pub fn reversible_update_amounts(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        new_amounts: Vec<i128>,
+    ) -> u64 {
+        require_not_paused(&env);
+        caller.require_auth();
+        let mut invoice = load_invoice(&env, invoice_id);
+        require_creator_or_cocreator(&invoice, &caller);
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice not pending");
+        assert!(invoice.funded == 0, "invoice already funded");
+        assert!(
+            new_amounts.len() == invoice.recipients.len(),
+            "amounts length mismatch"
+        );
+        for amount in new_amounts.iter() {
+            assert!(amount > 0, "amount must be positive");
+        }
+
+        let before = snapshot_operation_state(&invoice);
+        invoice.amounts = new_amounts.clone();
+        invoice.base_amounts = new_amounts;
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("rv_amts"), &caller);
+        record_reversible_op(&env, invoice_id, &invoice, ReversibleOpKind::UpdateAmounts, &caller, before)
+    }
+
+    /// Cancel an unfunded Pending invoice, recording an undoable operation.
+    /// Creator or co-creator only. No funds move, so undo is always safe
+    /// within the window.
+    pub fn reversible_cancel_invoice(env: Env, caller: Address, invoice_id: u64) -> u64 {
+        require_not_paused(&env);
+        caller.require_auth();
+        let mut invoice = load_invoice(&env, invoice_id);
+        require_creator_or_cocreator(&invoice, &caller);
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice not pending");
+        assert!(invoice.funded == 0, "invoice already funded");
+
+        let before = snapshot_operation_state(&invoice);
+        invoice.status = InvoiceStatus::Cancelled;
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("rv_cancel"), &caller);
+        record_reversible_op(&env, invoice_id, &invoice, ReversibleOpKind::Cancel, &caller, before)
+    }
+
+    /// Undo a recorded operation, restoring the invoice's pre-operation state.
+    ///
+    /// Callable by the operation's actor or the invoice creator, within the
+    /// rollback window. Rejected if the invoice has changed in any tracked
+    /// field since the operation (including a later reversible operation —
+    /// undo those first, most recent first).
+    pub fn undo_operation(env: Env, caller: Address, op_id: u64) {
+        require_not_paused(&env);
+        caller.require_auth();
+        let mut op: ReversibleOp = env
+            .storage()
+            .persistent()
+            .get(&reversible_op_key(op_id))
+            .expect("operation not found");
+        assert!(op.status == ReversibleOpStatus::Recorded, "operation not undoable");
+        assert!(env.ledger().timestamp() <= op.expires_at, "rollback window elapsed");
+
+        let mut invoice = load_invoice(&env, op.invoice_id);
+        assert!(
+            caller == op.actor || caller == invoice.creator,
+            "not authorized to undo"
+        );
+        let current_hash = hash_operation_snapshot(&env, &snapshot_operation_state(&invoice));
+        assert!(current_hash == op.after_hash, "invoice changed since operation");
+        assert!(
+            op.before.amounts.len() == invoice.recipients.len(),
+            "snapshot inconsistent with invoice"
+        );
+
+        invoice.deadline = op.before.deadline;
+        invoice.amounts = op.before.amounts.clone();
+        invoice.base_amounts = op.before.base_amounts.clone();
+        invoice.status = op.before.status.clone();
+        save_invoice(&env, op.invoice_id, &invoice);
+
+        op.status = ReversibleOpStatus::Undone;
+        op.undone_at = Some(env.ledger().timestamp());
+        env.storage().persistent().set(&reversible_op_key(op_id), &op);
+
+        append_audit_entry(&env, op.invoice_id, symbol_short!("rv_undo"), &caller);
+        events::reversible_op_undone(&env, op.invoice_id, op_id, &caller);
+    }
+
+    /// Fetch a reversible operation. A `Recorded` operation past its window
+    /// is reported as `Expired`.
+    pub fn get_operation(env: Env, op_id: u64) -> ReversibleOp {
+        let mut op: ReversibleOp = env
+            .storage()
+            .persistent()
+            .get(&reversible_op_key(op_id))
+            .expect("operation not found");
+        if op.status == ReversibleOpStatus::Recorded && env.ledger().timestamp() > op.expires_at {
+            op.status = ReversibleOpStatus::Expired;
+        }
+        op
+    }
+
+    /// IDs of every reversible operation recorded on `invoice_id`, oldest first.
+    pub fn get_invoice_operations(env: Env, invoice_id: u64) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&invoice_ops_key(invoice_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
 }
