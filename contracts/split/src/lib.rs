@@ -73,10 +73,10 @@ mod storage_keys;
 
 mod migrations;
 
-mod priority;
-mod creator_fee_tiers;
-mod invoice_metadata;
-mod confidential_tracking;
+mod insurance_pool;
+mod sustainability;
+mod cooperative;
+mod education_lockup;
 
 use error::ContractError;
 use validation::assert_valid_bps;
