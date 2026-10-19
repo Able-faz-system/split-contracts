@@ -365,6 +365,86 @@ pub fn invoice_cloned(env: &Env, source_id: u64, new_id: u64) {
     );
 }
 
+/// Issue #926: Emitted when an invoice is partially cloned.
+/// Topics: (split, part_cln, source_id)
+/// Data: (new_id, recipient_count)
+pub fn invoice_partially_cloned(env: &Env, source_id: u64, new_id: u64, recipient_count: u32) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("part_cln"), source_id),
+        (new_id, recipient_count),
+    );
+}
+
+/// Issue #927: Emitted when an archived invoice is restored.
+/// Topics: (split, restored, invoice_id)
+/// Data: (caller, ledger)
+pub fn invoice_restored(env: &Env, invoice_id: u64, caller: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("restored"), invoice_id),
+        (caller.clone(), env.ledger().sequence()),
+    );
+}
+
+/// Issue #927: Emitted when an archived invoice is purged by the cleanup policy.
+/// Topics: (split, arch_purg, invoice_id)
+/// Data: ledger
+pub fn invoice_archive_purged(env: &Env, invoice_id: u64) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("arch_purg"), invoice_id),
+        env.ledger().sequence(),
+    );
+}
+
+/// Issue #927: Emitted at the end of a scheduled archival sweep.
+/// Topics: (split, arch_swp)
+/// Data: (archived_count, cursor)
+pub fn archival_sweep_completed(env: &Env, archived_count: u32, cursor: u64) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("arch_swp")),
+        (archived_count, cursor),
+    );
+}
+
+/// Issue #927: Emitted when the archival policy changes.
+/// Topics: (split, arch_pol, admin)
+/// Data: (enabled, retention_ledgers)
+pub fn archival_policy_updated(env: &Env, admin: &Address, enabled: bool, retention_ledgers: u32) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("arch_pol"), admin.clone()),
+        (enabled, retention_ledgers),
+    );
+}
+
+/// Issue #928: Emitted on every recipient authentication state change.
+/// Topics: (split, rcp_auth, invoice_id)
+/// Data: (recipient, action, ledger)
+pub fn recipient_auth_changed(env: &Env, invoice_id: u64, recipient: &Address, action: soroban_sdk::Symbol) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("rcp_auth"), invoice_id),
+        (recipient.clone(), action, env.ledger().sequence()),
+    );
+}
+
+/// Issue #929: Emitted when a reversible operation is recorded.
+/// Topics: (split, rv_rec, invoice_id)
+/// Data: (op_id, kind)
+pub fn reversible_op_recorded(env: &Env, invoice_id: u64, op_id: u64, kind: crate::types::ReversibleOpKind) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("rv_rec"), invoice_id),
+        (op_id, kind),
+    );
+}
+
+/// Issue #929: Emitted when a reversible operation is undone.
+/// Topics: (split, rv_undo, invoice_id)
+/// Data: (op_id, caller, ledger)
+pub fn reversible_op_undone(env: &Env, invoice_id: u64, op_id: u64, caller: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("rv_undo"), invoice_id),
+        (op_id, caller.clone(), env.ledger().sequence()),
+    );
+}
+
 /// Emitted when an invoice is paused.
 /// Topics: (split, paused, invoice_id)
 /// Data: (creator, reason, auto_resume_at)
