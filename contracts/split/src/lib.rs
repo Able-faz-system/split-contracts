@@ -58,6 +58,10 @@ pub mod types;
 mod validation;
 mod calc;
 mod stats;
+pub mod security_audit;
+pub mod payment_tracking;
+pub mod velocity;
+pub mod split_rules;
 
 #[cfg(test)]
 mod test;
@@ -7305,6 +7309,9 @@ impl SplitContract {
                 .persistent()
                 .set(&global_vel_key(payer), &global_window);
         }
+
+        // Issue #912: contract-wide payment velocity limits (count, volume, cooldown).
+        velocity::enforce(env, payer, amount);
 
         let token_client = token::Client::new(env, &funding_token_for(&invoice));
 
@@ -15850,6 +15857,228 @@ impl SplitContract {
         } else {
             ((invoice.funded * 10_000) / total) as u32
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #892: Contract security audit framework
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl SplitContract {
+    /// Register `auditor` as a trusted security auditor. Admin only.
+    pub fn add_security_auditor(env: Env, auditor: Address) {
+        require_admin(&env);
+        security_audit::add_auditor(&env, &auditor);
+    }
+
+    /// Remove a previously registered security auditor. Admin only.
+    pub fn remove_security_auditor(env: Env, auditor: Address) {
+        require_admin(&env);
+        security_audit::remove_auditor(&env, &auditor);
+    }
+
+    /// List all registered security auditors.
+    pub fn get_security_auditors(env: Env) -> Vec<Address> {
+        security_audit::get_auditors(&env)
+    }
+
+    /// Run the contract-level security audit and persist the report.
+    /// Callable by a registered auditor or the admin.
+    pub fn run_security_audit(env: Env, auditor: Address) -> security_audit::SecurityAuditReport {
+        security_audit::run_contract_audit(&env, &auditor)
+    }
+
+    /// Run the invoice-level security audit for `invoice_id` and persist the report.
+    /// Callable by a registered auditor or the admin.
+    pub fn run_invoice_security_audit(
+        env: Env,
+        auditor: Address,
+        invoice_id: u64,
+    ) -> security_audit::SecurityAuditReport {
+        security_audit::run_invoice_audit(&env, &auditor, invoice_id)
+    }
+
+    /// Fetch a stored security audit report by id.
+    pub fn get_security_audit(
+        env: Env,
+        audit_id: u64,
+    ) -> Option<security_audit::SecurityAuditReport> {
+        security_audit::get_report(&env, audit_id)
+    }
+
+    /// Total number of security audits run so far (also the latest audit id).
+    pub fn get_security_audit_count(env: Env) -> u64 {
+        security_audit::get_audit_count(&env)
+    }
+
+    /// Append an entry to the bounded security event log.
+    /// Callable by a registered auditor or the admin.
+    pub fn log_security_event(
+        env: Env,
+        reporter: Address,
+        kind: Symbol,
+        severity: security_audit::AuditSeverity,
+        invoice_id: Option<u64>,
+    ) {
+        security_audit::log_security_event(&env, &reporter, kind, severity, invoice_id);
+    }
+
+    /// Return the security event log, oldest entry first.
+    pub fn get_security_events(env: Env) -> Vec<security_audit::SecurityEvent> {
+        security_audit::get_security_events(&env)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #911: Partial invoice payment tracking
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl SplitContract {
+    /// Initialise per-recipient partial payment tracking for an invoice with
+    /// the given milestone thresholds (ascending basis points). Creator only.
+    pub fn init_payment_tracking(
+        env: Env,
+        creator: Address,
+        invoice_id: u64,
+        milestone_bps: Vec<u32>,
+    ) -> payment_tracking::PaymentTracker {
+        require_not_paused(&env);
+        payment_tracking::init_tracking(&env, &creator, invoice_id, milestone_bps)
+    }
+
+    /// Record a partial payment to `recipient`. Creator only.
+    pub fn record_partial_payment(
+        env: Env,
+        creator: Address,
+        invoice_id: u64,
+        recipient: Address,
+        amount: i128,
+    ) -> payment_tracking::PaymentTracker {
+        require_not_paused(&env);
+        payment_tracking::record_payment(&env, &creator, invoice_id, &recipient, amount)
+    }
+
+    /// Settle a reached milestone. Milestones settle strictly in order. Creator only.
+    pub fn settle_payment_milestone(
+        env: Env,
+        creator: Address,
+        invoice_id: u64,
+        milestone_index: u32,
+    ) -> payment_tracking::PaymentTracker {
+        require_not_paused(&env);
+        payment_tracking::settle_milestone(&env, &creator, invoice_id, milestone_index)
+    }
+
+    /// Return the partial payment tracker for an invoice, if initialised.
+    pub fn get_payment_tracker(
+        env: Env,
+        invoice_id: u64,
+    ) -> Option<payment_tracking::PaymentTracker> {
+        payment_tracking::get_tracker(&env, invoice_id)
+    }
+
+    /// Return the paid-flag bitmask (bit `i` set = recipient `i` fully paid).
+    pub fn get_recipient_paid_flags(env: Env, invoice_id: u64) -> u64 {
+        payment_tracking::get_paid_flags(&env, invoice_id)
+    }
+
+    /// Whether recipient at `index` has been fully paid.
+    pub fn is_recipient_paid(env: Env, invoice_id: u64, index: u32) -> bool {
+        payment_tracking::is_recipient_paid(&env, invoice_id, index)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #912: Payment velocity limits
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl SplitContract {
+    /// Set the default velocity limits applied to every payer. Admin only.
+    pub fn set_velocity_config(env: Env, config: velocity::VelocityConfig) {
+        require_admin(&env);
+        velocity::set_default_config(&env, &config);
+    }
+
+    /// Return the default velocity limits.
+    pub fn get_velocity_config(env: Env) -> velocity::VelocityConfig {
+        velocity::get_default_config(&env)
+    }
+
+    /// Set (`Some`) or clear (`None`) a per-payer velocity override. Admin only.
+    pub fn set_payer_velocity_override(
+        env: Env,
+        payer: Address,
+        config: Option<velocity::VelocityConfig>,
+    ) {
+        require_admin(&env);
+        velocity::set_payer_override(&env, &payer, &config);
+    }
+
+    /// Return the velocity limits that apply to `payer`.
+    pub fn get_payer_velocity_config(env: Env, payer: Address) -> velocity::VelocityConfig {
+        velocity::effective_config(&env, &payer)
+    }
+
+    /// Return the current velocity window state for `payer`.
+    pub fn get_payer_velocity_state(env: Env, payer: Address) -> velocity::VelocityState {
+        velocity::get_state(&env, &payer)
+    }
+
+    /// Whether a payment of `amount` from `payer` would pass velocity checks now.
+    pub fn check_payer_velocity(env: Env, payer: Address, amount: i128) -> bool {
+        velocity::would_allow(&env, &payer, amount)
+    }
+
+    /// Clear a payer's velocity state. Admin only.
+    pub fn reset_payer_velocity(env: Env, payer: Address) {
+        require_admin(&env);
+        velocity::reset_state(&env, &payer);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #913: Split rules engine
+// ---------------------------------------------------------------------------
+#[contractimpl]
+impl SplitContract {
+    /// Attach criteria-based split rules to a pending invoice. Creator only.
+    pub fn set_invoice_split_rules(
+        env: Env,
+        creator: Address,
+        invoice_id: u64,
+        rules: Vec<split_rules::SplitRuleDef>,
+    ) {
+        require_not_paused(&env);
+        split_rules::set_rules(&env, &creator, invoice_id, rules);
+    }
+
+    /// Remove the split rules from a pending invoice. Creator only.
+    pub fn clear_invoice_split_rules(env: Env, creator: Address, invoice_id: u64) {
+        require_not_paused(&env);
+        split_rules::clear_rules(&env, &creator, invoice_id);
+    }
+
+    /// Return the split rules stored for an invoice (empty if none).
+    pub fn get_invoice_split_rules(env: Env, invoice_id: u64) -> Vec<split_rules::SplitRuleDef> {
+        split_rules::get_rules(&env, invoice_id)
+    }
+
+    /// Evaluate an invoice's split rules against its current funded amount,
+    /// payment count and the ledger timestamp. Returns one amount per recipient.
+    pub fn evaluate_invoice_split_rules(env: Env, invoice_id: u64) -> Vec<i128> {
+        split_rules::evaluate_for_invoice(&env, invoice_id)
+    }
+
+    /// Validate and evaluate `rules` against an arbitrary context without
+    /// storing anything. Useful for previewing a rule set before attaching it.
+    pub fn preview_split_rules(
+        env: Env,
+        rules: Vec<split_rules::SplitRuleDef>,
+        recipient_count: u32,
+        context: split_rules::RuleContext,
+    ) -> Vec<i128> {
+        split_rules::validate_rules(&rules, recipient_count);
+        split_rules::evaluate(&env, &rules, recipient_count, &context)
     }
 }
 

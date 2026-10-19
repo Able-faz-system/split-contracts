@@ -27,7 +27,7 @@
 
 use crate::storage_keys::ev_seq_key;
 use crate::types::{DisputeOutcome, FeeSplit, InvoicePhase, InvoiceStatus, OverfundingPolicy, RepScore, TimelockAction};
-use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String, Vec};
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec};
 
 // ---------------------------------------------------------------------------
 // Event sequence helper (per-invoice, temporary-storage counter)
@@ -1911,6 +1911,144 @@ pub fn deadline_extended(env: &Env, invoice_id: u64, old_deadline: u64, new_dead
     env.events().publish(
         (symbol_short!("split"), symbol_short!("dl_ext"), invoice_id),
         (old_deadline, new_deadline),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #892: Security audit framework events
+// ---------------------------------------------------------------------------
+
+/// Emitted when an auditor is registered (`added = true`) or removed.
+/// Topics: (split, sec_adtr)
+/// Data: (auditor, added)
+pub fn security_auditor_updated(env: &Env, auditor: &Address, added: bool) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("sec_adtr")),
+        (auditor.clone(), added),
+    );
+}
+
+/// Emitted when a security audit run completes.
+/// Topics: (split, sec_aud, audit_id)
+/// Data: (auditor, invoice_id, failed_count, risk_score, ledger)
+pub fn security_audit_completed(
+    env: &Env,
+    audit_id: u64,
+    auditor: &Address,
+    invoice_id: Option<u64>,
+    failed_count: u32,
+    risk_score: u32,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("sec_aud"), audit_id),
+        (
+            auditor.clone(),
+            invoice_id,
+            failed_count,
+            risk_score,
+            env.ledger().sequence(),
+        ),
+    );
+}
+
+/// Emitted when an auditor logs a security event.
+/// Topics: (split, sec_evt, kind)
+/// Data: (reporter, severity, invoice_id, timestamp)
+pub fn security_event_logged(
+    env: &Env,
+    reporter: &Address,
+    kind: &Symbol,
+    severity: u32,
+    invoice_id: Option<u64>,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("sec_evt"), kind.clone()),
+        (
+            reporter.clone(),
+            severity,
+            invoice_id,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #911: Partial invoice payment tracking events
+// ---------------------------------------------------------------------------
+
+/// Emitted when partial payment tracking is initialised for an invoice.
+/// Topics: (split, pt_init, invoice_id)
+/// Data: (total_due, milestone_count, event_seq)
+pub fn payment_tracking_initialised(env: &Env, invoice_id: u64, total_due: i128, milestone_count: u32) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pt_init"), invoice_id),
+        (total_due, milestone_count, event_seq),
+    );
+}
+
+/// Emitted when a partial payment to a recipient is recorded.
+/// Topics: (split, pt_pay, invoice_id)
+/// Data: (recipient, amount, total_paid_to_recipient, fully_paid, event_seq)
+pub fn partial_payment_recorded(
+    env: &Env,
+    invoice_id: u64,
+    recipient: &Address,
+    amount: i128,
+    recipient_paid: i128,
+    fully_paid: bool,
+) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pt_pay"), invoice_id),
+        (recipient.clone(), amount, recipient_paid, fully_paid, event_seq),
+    );
+}
+
+/// Emitted when a payment milestone changes state (1 = Reached, 2 = Settled).
+/// Topics: (split, pt_mile, invoice_id)
+/// Data: (threshold_bps, state, event_seq)
+pub fn payment_milestone_state(env: &Env, invoice_id: u64, threshold_bps: u32, state: u32) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pt_mile"), invoice_id),
+        (threshold_bps, state, event_seq),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #912: Payment velocity limit events
+// ---------------------------------------------------------------------------
+
+/// Emitted when the default (`payer = None`) or a per-payer velocity config
+/// is set. A cleared override is reported with all limits at zero.
+/// Topics: (split, vel_cfg)
+/// Data: (payer, max_payments, max_amount, window_secs)
+pub fn velocity_config_set(
+    env: &Env,
+    payer: Option<Address>,
+    max_payments: u32,
+    max_amount: i128,
+    window_secs: u64,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("vel_cfg")),
+        (payer, max_payments, max_amount, window_secs),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #913: Split rules engine events
+// ---------------------------------------------------------------------------
+
+/// Emitted when an invoice's split rules are set (`rule_count > 0`) or cleared.
+/// Topics: (split, srules, invoice_id)
+/// Data: (rule_count, event_seq)
+pub fn split_rules_set(env: &Env, invoice_id: u64, rule_count: u32) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("srules"), invoice_id),
+        (rule_count, event_seq),
     );
 }
 
